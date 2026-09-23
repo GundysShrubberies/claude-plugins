@@ -163,3 +163,25 @@ defaults. If the config is missing, the scripts stop and tell you why.
   board. It doesn't create the project board itself; ask Connor for that.
 - **`kit-board add|move|list|check`**: board operations. The Status options are
   Backlog, Approved, In Progress, Needs help, and Done.
+
+## Building and shipping
+
+- **`/dispatch`** (or just say "go"): builds everything in Approved, up to two
+  at a time, each in its own worktree. A separate `kit-reviewer` agent checks
+  each change, and then you're asked in plain English: *"Want me to put it
+  live?"* Nothing ships without your yes.
+- **The last confirm is enforced.** The plugin's guard sends every `kit-merge`
+  to Claude Code's own "Allow?" prompt, and blocks `gh pr merge`, merging
+  through the API, and any merge from a subagent or outside `merge_allowlist`.
+- **`/ship-mode ask|batch|operator`**: controls *how* you're asked: one at a
+  time (default), all at once, or leave it for Connor. It never controls
+  *whether* you're asked. **You can change this any time.** Just say so, or
+  run `/ship-mode`.
+- **`/work-issue <n>`**: builds one issue into a PR (implement → `/qa` →
+  self-review → PR). It stops there and doesn't merge.
+- **`/qa`**: runs whatever lint, typecheck, test or build the repo has, plus
+  `gitleaks`, locally. No GitHub Actions needed.
+- **`kit-merge`**: the only way anything ships. Before merging it checks that
+  the repo is allowlisted, the branch is a `kit/` branch, the reviewer has
+  approved the current version of the change, and there's no `kit-needs-help`
+  label.

@@ -57,6 +57,7 @@ tool=$(jq -r '.tool_name // empty' <<<"$input" 2>/dev/null) || exit 0
 transcript=$(jq -r '.transcript_path // empty' <<<"$input" 2>/dev/null || true)
 session=$(jq -r '.session_id // empty' <<<"$input" 2>/dev/null || true)
 agent_id=$(jq -r '.agent_id // empty' <<<"$input" 2>/dev/null || true)
+cwd=$(jq -r '.cwd // empty' <<<"$input" 2>/dev/null || true)
 # Sub-agent calls carry agent_id/agent_type; transcript_path is the PARENT session's,
 # so it cannot be used to tell them apart. A transcript_path under .../subagents/ is
 # still honoured as a subagent signal for callers that pass one.
@@ -159,10 +160,63 @@ max_sleep() {
     | sort -n | tail -1
 }
 
+# --- gundy-kit: ship only through kit-merge, and only for an allowlisted repo ---------
+# kit_find_config <start-dir>: search upward for .kit/config.json, same rule kit-board
+# and kit-merge themselves use. Empty output = none found.
+kit_find_config() {
+  local dir="$1"
+  while [ -n "$dir" ] && [ "$dir" != "/" ]; do
+    if [ -f "$dir/.kit/config.json" ]; then printf '%s\n' "$dir/.kit/config.json"; return 0; fi
+    dir=$(dirname "$dir")
+  done
+  return 1
+}
+
 case "$tool" in
   Bash)
     cmd=$(jq -r '.tool_input.command // empty' <<<"$input" 2>/dev/null || true)
     bg=$(jq -r '.tool_input.run_in_background // false' <<<"$input" 2>/dev/null || echo false)
+    kit_norm=$(strip_quotes "$cmd")
+    # A raw merge call bypasses the whole point of this plugin (a human's explicit
+    # yes, per session): deny it everywhere, in every session, no exceptions.
+    if at_cmd "$kit_norm" 'gh[[:space:]]+pr[[:space:]]+merge'; then
+      deny "Raw 'gh pr merge' is never allowed here. Ship only after a human has explicitly said yes in this session (see /dispatch's SHIP GATE), then run kit-merge <pr> — it re-checks the allowlist, review, and mergeability gates itself before merging anything."
+    fi
+    # A kit-merge invocation is only ever denied for one reason here: its target
+    # repo isn't on the allowlist. kit-merge re-checks this itself too (belt and
+    # braces) — this is a pre-check so a model can't work around it by editing
+    # .kit/config.json mid-call or racing the script's own read.
+    if grep -Eq "${cp}([^[:space:]]*/)?kit-merge([[:space:]]|$)" <<<"$kit_norm"; then
+      kit_repo=$(sed -nE 's#.*(^|[[:space:]])--repo[[:space:]]+([^[:space:]]+).*#\2#p' <<<"$cmd" | head -n1)
+      kit_cfg=""
+      [ -n "$cwd" ] && kit_cfg=$(kit_find_config "$cwd" 2>/dev/null || true)
+      if [ -z "$kit_repo" ] && [ -n "$kit_cfg" ]; then
+        kit_repo=$(jq -r '.repo // empty' "$kit_cfg" 2>/dev/null || true)
+      fi
+      if [ -n "$kit_repo" ] && [ -n "$kit_cfg" ]; then
+        kit_allowed=$(jq -r --arg r "$kit_repo" '(.merge_allowlist // []) | any(. == $r)' "$kit_cfg" 2>/dev/null || echo false)
+        if [ "$kit_allowed" != "true" ]; then
+          deny "kit-merge target repo '$kit_repo' is not in .kit/config.json's merge_allowlist — an operator has to add it there before anything from this repo can ship."
+        fi
+      fi
+      # No config found, or --repo couldn't be resolved: kit-merge's own
+      # (mandatory) config/allowlist check still runs.
+      #
+      # The ship gate is enforced here, not only in /dispatch's prose: a subagent
+      # never ships, and the main session always gets Claude Code's own permission
+      # prompt, so a person confirms every merge even if an issue's text talks the
+      # model into skipping the question.
+      if [ "$in_subagent" = 1 ]; then
+        deny "Only the main session ships, after a person says yes. Return your report and let /dispatch ask."
+      fi
+      jq -cn --arg r "Put this change live? (kit-merge: this merges the change into the repo)" \
+        '{hookSpecificOutput:{hookEventName:"PreToolUse",permissionDecision:"ask",permissionDecisionReason:$r}}'
+      exit 0
+    fi
+    # Merging through the REST/GraphQL API is the same act as gh pr merge.
+    if at_cmd "$kit_norm" 'gh[[:space:]]+api' && grep -Eqi 'pulls/[0-9]+/merge|mergePullRequest|enablePullRequestAutoMerge' <<<"$cmd"; then
+      deny "Merging through the GitHub API isn't allowed here. Ship only with kit-merge <pr>, after a person says yes."
+    fi
     if [ "$bg" = "true" ] && grep -Eq "$ci_wait_re" <<<"$cmd"; then
       deny "CI waits must block in the foreground: run $BIN_DIR/pr-checks-wait <pr> -R <owner/repo> with run_in_background false and timeout 600000 (call again on exit 2). Backgrounding it makes you return early and burns a resume."
     fi

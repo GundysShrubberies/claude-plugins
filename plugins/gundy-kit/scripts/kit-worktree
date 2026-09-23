@@ -1,0 +1,93 @@
+#!/usr/bin/env bash
+# kit-worktree — give the current session an isolated git worktree for a
+# branch, so /dispatch can run more than one kit-worker at once without two
+# of them racing the same repo's git HEAD.
+#
+# Worktrees live OUTSIDE the repo, under a sibling dir keyed by repo name, so
+# they never show up in `git status` and need no per-repo .gitignore entry:
+#
+#     ~/.claude/gundy-kit/worktrees/<repo>/<branch>
+#
+# Usage:
+#   kit-worktree [-C <repo-dir>] <branch> [<base-ref>]
+#     -C <repo-dir>   target repo (default: git root of $PWD)
+#     <branch>        branch to isolate; reused if it already exists LOCALLY
+#                      or on origin (a remote-only branch is checked out and
+#                      tracked, never re-created off the default branch)
+#     <base-ref>      base for a NEW branch (default: the repo's origin
+#                      default branch)
+#
+# Prints the worktree path on stdout (logs go to stderr):
+#     WT=$(kit-worktree kit/42-fix-typo) && cd "$WT"
+#
+# Clean up a finished worktree with: git worktree remove <path>  (--force if needed)
+set -euo pipefail
+
+WT_HOME="$HOME/.claude/gundy-kit/worktrees"
+
+repo_dir="$PWD"
+while [ "${1:-}" = "-C" ]; do
+  [ $# -ge 2 ] || { echo "kit-worktree: -C needs a value" >&2; exit 2; }
+  repo_dir="$2"; shift 2
+done
+
+branch="${1:-}"
+base_ref="${2:-}"
+if [ -z "$branch" ]; then
+  echo "usage: kit-worktree [-C <repo-dir>] <branch> [<base-ref>]" >&2
+  exit 2
+fi
+
+root=$(git -C "$repo_dir" rev-parse --show-toplevel 2>/dev/null) || {
+  echo "kit-worktree: $repo_dir is not inside a git repo" >&2
+  exit 1
+}
+repo_name=$(basename "$root")
+wt_path="$WT_HOME/$repo_name/$branch"
+
+log() { echo "kit-worktree: $*" >&2; }
+
+# Already have a worktree for this branch at the expected path → reuse it.
+if [ -d "$wt_path" ] && git -C "$wt_path" rev-parse --show-toplevel >/dev/null 2>&1; then
+  log "reusing existing worktree $wt_path"
+  printf '%s\n' "$wt_path"
+  exit 0
+fi
+
+# The branch may already be checked out in some other worktree (incl. the
+# primary checkout). Surface that path rather than failing — git forbids two
+# checkouts of one branch, and the caller can decide what to do.
+existing=$(git -C "$root" worktree list --porcelain \
+  | awk -v b="refs/heads/$branch" '
+      /^worktree /{p=substr($0,10)}
+      $0=="branch "b{print p}')
+if [ -n "$existing" ]; then
+  log "branch '$branch' is already checked out at $existing"
+  printf '%s\n' "$existing"
+  exit 0
+fi
+
+mkdir -p "$WT_HOME/$repo_name"
+
+# Fetch BEFORE deciding what kind of branch this is: the remote-branch case
+# below is only detectable once origin's refs are current, and a stale clone
+# would otherwise fall through to "new branch" and silently fork off the
+# default branch, throwing away work already pushed under this name.
+git -C "$root" fetch --quiet origin || log "warning: 'git fetch origin' failed; using local refs"
+
+if git -C "$root" show-ref --verify --quiet "refs/heads/$branch"; then
+  log "adding worktree for existing branch '$branch'"
+  git -C "$root" worktree add "$wt_path" "$branch" >&2
+elif git -C "$root" show-ref --verify --quiet "refs/remotes/origin/$branch"; then
+  log "adding worktree tracking existing remote branch 'origin/$branch'"
+  git -C "$root" worktree add --track -b "$branch" "$wt_path" "origin/$branch" >&2
+else
+  if [ -z "$base_ref" ]; then
+    base_ref=$(git -C "$root" symbolic-ref --quiet refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/@@')
+    [ -z "$base_ref" ] && base_ref="origin/main"
+  fi
+  log "creating branch '$branch' off '$base_ref' in new worktree"
+  git -C "$root" worktree add -b "$branch" "$wt_path" "$base_ref" >&2
+fi
+
+printf '%s\n' "$wt_path"

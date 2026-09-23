@@ -1,6 +1,6 @@
 {
   "name": "gundy-kit",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Commands, skills, scripts, and hooks for Claude Code: hardening plans, prototyping, commit/push/PR flow, cloud-agent status, cross-machine hand-offs, and a tool guard against wasteful tool-call patterns.",
   "repository": "https://github.com/GundysShrubberies/claude-plugins",
   "author": {

@@ -22,6 +22,11 @@
             "type": "command",
             "command": "${CLAUDE_PLUGIN_ROOT}/scripts/kit-working-style",
             "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/scripts/kit-guided-context",
+            "timeout": 5
           }
         ]
       }

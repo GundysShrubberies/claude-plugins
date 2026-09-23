@@ -1,0 +1,267 @@
+#!/usr/bin/env bash
+# kit-board — read and write the shared GitHub Projects v2 board for a
+# gundy-kit repo, driven entirely by that repo's .kit/config.json.
+#
+# WHY this exists
+# ----------------
+# /raise-issue, /vibe, /dispatch, and /status all need to add issues to a
+# board, move a card's Status, list cards by Status, and sanity-check the
+# board is wired up right — without any of them hardcoding a project number,
+# field id, or option id. This script is the one place that does the
+# GraphQL. NO DEFAULTS: every value it needs (repo, project_owner,
+# project_number) comes from .kit/config.json, found by searching upward
+# from $PWD. Missing config is a plain-English exit 1, never a silent
+# fallback to some other project.
+#
+# Config file: .kit/config.json at a repo's root —
+#   {"repo":"OWNER/name","project_owner":"OWNER","project_number":N,
+#    "merge_allowlist":["OWNER/name"]}
+#
+# Board Status options (single-select field named "Status"):
+#   Backlog, Approved, In Progress, Needs help, Done
+# Labels this plugin uses: kit-working, kit-needs-help
+#
+# Usage:
+#   kit-board add <issue-url> [status]     # default status: Approved
+#   kit-board move <issue-number> <status>
+#   kit-board list <status>                # prints number<TAB>title<TAB>url
+#   kit-board check                        # verifies project/field/labels
+#
+# Exit codes: 0 ok · 1 not found / not on board / check found problems ·
+# 4 GitHub API failure · 64 usage / bad config.
+set -euo pipefail
+
+usage() { sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+die() { echo "kit-board: $1" >&2; exit "${2:-1}"; }
+
+STATUS_OPTIONS=(Backlog Approved "In Progress" "Needs help" Done)
+LABELS=(kit-working kit-needs-help)
+
+valid_status() {
+  local s=$1 opt
+  for opt in "${STATUS_OPTIONS[@]}"; do
+    [ "$opt" = "$s" ] && return 0
+  done
+  return 1
+}
+
+# find_config: search upward from $PWD for .kit/config.json.
+find_config() {
+  local dir="$PWD"
+  while true; do
+    if [ -f "$dir/.kit/config.json" ]; then
+      printf '%s\n' "$dir/.kit/config.json"
+      return 0
+    fi
+    [ "$dir" = "/" ] && return 1
+    dir=$(dirname "$dir")
+  done
+}
+
+REPO=""
+PROJECT_OWNER=""
+PROJECT_NUMBER=""
+load_config() {
+  local path
+  path=$(find_config) || die "no .kit/config.json found searching upward from $PWD. This repo hasn't been set up for the board yet — run kit-setup (see /start-here)." 64
+  jq -e . "$path" >/dev/null 2>&1 || die "$path exists but isn't valid JSON — fix or recreate it (see /start-here)." 64
+  REPO=$(jq -r '.repo // empty' "$path")
+  PROJECT_OWNER=$(jq -r '.project_owner // empty' "$path")
+  PROJECT_NUMBER=$(jq -r '.project_number // empty' "$path")
+  [ -n "$REPO" ] || die "$path is missing \"repo\" — add it, e.g. \"repo\": \"OWNER/name\"." 64
+  [ -n "$PROJECT_OWNER" ] || die "$path is missing \"project_owner\"." 64
+  case "$PROJECT_NUMBER" in
+    ''|*[!0-9]*) die "$path's \"project_number\" is missing or not a whole number. Ask whoever owns the board for the project number, then set it in .kit/config.json." 64 ;;
+  esac
+}
+
+# --- Project/field resolution (fresh each run — this plugin targets a
+# single small repo's board, not a fleet, so no cache layer). ---------------
+PROJECT_ID=""
+resolve_project_id() {
+  local out
+  out=$(gh project view "$PROJECT_NUMBER" --owner "$PROJECT_OWNER" --format json -q .id 2>&1) || \
+    die "couldn't find project $PROJECT_NUMBER owned by $PROJECT_OWNER. Check project_number in .kit/config.json, or ask whoever set up the board to confirm it exists and you have access to it." 4
+  PROJECT_ID="$out"
+}
+
+STATUS_META=""
+resolve_status_field() {
+  local raw
+  # shellcheck disable=SC2016  # $p is a GraphQL variable, not a shell one
+  raw=$(gh api graphql -f query='
+    query($p:ID!){
+      node(id:$p){
+        ... on ProjectV2{
+          fields(first:50){
+            nodes{ ... on ProjectV2SingleSelectField{ id name options{ id name } } }
+          }
+        }
+      }
+    }' -f p="$PROJECT_ID") || die "couldn't read the project's fields (GitHub API error)." 4
+  STATUS_META=$(jq -c '.data.node.fields.nodes[] | select(.name=="Status")' <<<"$raw")
+  [ -n "$STATUS_META" ] && [ "$STATUS_META" != "null" ] || \
+    die "the project has no field named \"Status\" — run kit-board check for details." 4
+}
+
+status_option_id() { # <status name>
+  jq -r --arg s "$1" '.options[] | select(.name==$s) | .id // empty' <<<"$STATUS_META"
+}
+
+set_status() { # <item_id> <option_id>
+  # shellcheck disable=SC2016  # $p/$i/$f/$v are GraphQL variables, not shell ones
+  gh api graphql -f query='
+    mutation($p:ID!,$i:ID!,$f:ID!,$v:String!){
+      updateProjectV2ItemFieldValue(input:{
+        projectId:$p, itemId:$i, fieldId:$f,
+        value:{ singleSelectOptionId:$v }
+      }){ projectV2Item{ id } }
+    }' -f p="$PROJECT_ID" -f i="$1" -f f="$(jq -r '.id' <<<"$STATUS_META")" -f v="$2" >/dev/null 2>&1 || \
+    die "couldn't set the board's Status field (GitHub API error)." 4
+}
+
+cmd_add() {
+  local url=${1:-} status=${2:-Approved}
+  [ -n "$url" ] || die "usage: kit-board add <issue-url> [status]" 64
+  valid_status "$status" || die "'$status' isn't a real board status. Use one of: ${STATUS_OPTIONS[*]}" 64
+  resolve_project_id
+  resolve_status_field
+  local option_id
+  option_id=$(status_option_id "$status")
+  [ -n "$option_id" ] || die "the board's Status field has no \"$status\" option — run kit-board check." 4
+  local item_id
+  item_id=$(gh project item-add "$PROJECT_NUMBER" --owner "$PROJECT_OWNER" --url "$url" --format json -q .id 2>&1) || \
+    die "couldn't add $url to the board — check the URL is a real issue/PR and you have access." 4
+  set_status "$item_id" "$option_id"
+  echo "Added $url to the board as $status."
+}
+
+cmd_move() {
+  local n=${1:-} status=${2:-}
+  [ -n "$n" ] && [ -n "$status" ] || die "usage: kit-board move <issue-number> <status>" 64
+  valid_status "$status" || die "'$status' isn't a real board status. Use one of: ${STATUS_OPTIONS[*]}" 64
+  resolve_project_id
+  resolve_status_field
+  local option_id
+  option_id=$(status_option_id "$status")
+  [ -n "$option_id" ] || die "the board's Status field has no \"$status\" option — run kit-board check." 4
+  local owner_part="${REPO%%/*}" repo_part="${REPO#*/}" item_json item_id
+  # shellcheck disable=SC2016  # $o/$r/$n are GraphQL variables, not shell ones
+  item_json=$(gh api graphql -f query='
+    query($o:String!,$r:String!,$n:Int!){
+      repository(owner:$o, name:$r){
+        issue(number:$n){
+          projectItems(first:10){ nodes{ id project{ number } } }
+        }
+      }
+    }' -f o="$owner_part" -f r="$repo_part" -F n="$n") || die "couldn't look up issue #$n in $REPO." 4
+  item_id=$(jq -r --argjson proj "$PROJECT_NUMBER" \
+    '.data.repository.issue.projectItems.nodes[] | select(.project.number==$proj) | .id' \
+    <<<"$item_json" | head -n1)
+  [ -n "$item_id" ] || die "$REPO#$n isn't on the board yet — add it first with kit-board add." 1
+  set_status "$item_id" "$option_id"
+  echo "Moved $REPO#$n to $status."
+}
+
+cmd_list() {
+  local status=${1:-}
+  [ -n "$status" ] || die "usage: kit-board list <status>" 64
+  valid_status "$status" || die "'$status' isn't a real board status. Use one of: ${STATUS_OPTIONS[*]}" 64
+  resolve_project_id
+  local after="null" has_next=1 page
+  while [ "$has_next" -eq 1 ]; do
+    # shellcheck disable=SC2016  # $p/$after are GraphQL variables, not shell ones
+    page=$(gh api graphql -f query='
+      query($p:ID!,$after:String){
+        node(id:$p){
+          ... on ProjectV2{
+            items(first:50, after:$after){
+              pageInfo{ hasNextPage endCursor }
+              nodes{
+                fieldValueByName(name:"Status"){ ... on ProjectV2ItemFieldSingleSelectValue{ name } }
+                content{
+                  ... on Issue{ number title url }
+                  ... on PullRequest{ number title url }
+                }
+              }
+            }
+          }
+        }
+      }' -f p="$PROJECT_ID" -F after="$after") || die "couldn't read board items (GitHub API error)." 4
+    jq -r --arg s "$status" \
+      '.data.node.items.nodes[] | select(.fieldValueByName.name==$s and .content != null) | [(.content.number|tostring), .content.title, .content.url] | @tsv' \
+      <<<"$page"
+    has_next=$(jq -r 'if .data.node.items.pageInfo.hasNextPage then 1 else 0 end' <<<"$page")
+    after=$(jq -r '.data.node.items.pageInfo.endCursor // "null"' <<<"$page")
+  done
+}
+
+cmd_check() {
+  local problems=0
+  echo "Checking the board for $REPO (project $PROJECT_NUMBER, owner $PROJECT_OWNER)..."
+  if ! gh project view "$PROJECT_NUMBER" --owner "$PROJECT_OWNER" >/dev/null 2>&1; then
+    echo "  MISSING: project $PROJECT_NUMBER owned by $PROJECT_OWNER doesn't exist, or you can't see it."
+    echo "    -> ask whoever owns the board to create a GitHub Project (Projects v2) numbered $PROJECT_NUMBER under $PROJECT_OWNER, or fix project_number in .kit/config.json."
+    problems=$((problems + 1))
+  else
+    resolve_project_id
+    local raw status_meta
+    # shellcheck disable=SC2016  # $p is a GraphQL variable, not a shell one
+    raw=$(gh api graphql -f query='
+      query($p:ID!){
+        node(id:$p){
+          ... on ProjectV2{
+            fields(first:50){
+              nodes{ ... on ProjectV2SingleSelectField{ id name options{ id name } } }
+            }
+          }
+        }
+      }' -f p="$PROJECT_ID") || die "couldn't read the project's fields (GitHub API error)." 4
+    status_meta=$(jq -c '.data.node.fields.nodes[] | select(.name=="Status")' <<<"$raw")
+    if [ -z "$status_meta" ] || [ "$status_meta" = "null" ]; then
+      echo "  MISSING: the project has no field named \"Status\"."
+      echo "    -> add a single-select field named Status with these options: ${STATUS_OPTIONS[*]}"
+      problems=$((problems + 1))
+    else
+      local missing_opts=() opt id
+      for opt in "${STATUS_OPTIONS[@]}"; do
+        id=$(jq -r --arg o "$opt" '.options[] | select(.name==$o) | .id // empty' <<<"$status_meta")
+        [ -n "$id" ] || missing_opts+=("$opt")
+      done
+      if [ "${#missing_opts[@]}" -gt 0 ]; then
+        echo "  MISSING Status option(s): ${missing_opts[*]}"
+        echo "    -> add these options to the project's Status field."
+        problems=$((problems + 1))
+      else
+        echo "  OK: project found, Status field has all 5 options."
+      fi
+    fi
+  fi
+  local l have
+  for l in "${LABELS[@]}"; do
+    have=$(gh label list --repo "$REPO" --json name -q '.[].name' 2>/dev/null | grep -Fxc "$l" || true)
+    if [ "$have" -ge 1 ]; then
+      echo "  OK: label \"$l\" exists in $REPO."
+    else
+      echo "  MISSING: label \"$l\" in $REPO."
+      echo "    -> run kit-setup to create it, or: gh label create \"$l\" --repo \"$REPO\""
+      problems=$((problems + 1))
+    fi
+  done
+  if [ "$problems" -eq 0 ]; then
+    echo "Everything looks good."
+    return 0
+  fi
+  echo "$problems thing(s) need attention (see above)."
+  return 1
+}
+
+[ $# -ge 1 ] || usage 64
+case "$1" in
+  -h|--help) usage ;;
+  add) shift; load_config; cmd_add "$@" ;;
+  move) shift; load_config; cmd_move "$@" ;;
+  list) shift; load_config; cmd_list "$@" ;;
+  check) shift; load_config; cmd_check "$@" ;;
+  *) die "unknown command '$1' (want: add, move, list, check)" 64 ;;
+esac

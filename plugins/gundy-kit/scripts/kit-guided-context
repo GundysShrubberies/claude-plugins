@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# kit-guided-context — SessionStart hook: when guided mode is on (the flag
+# file ~/.claude/gundy-kit/guided exists — toggled by /guided), prints
+# standing instructions for working with a non-coder collaborator. Prints
+# nothing and exits 0 when the flag is absent, so an unguided session (the
+# technical collaborator, most likely) sees no extra context.
+set -euo pipefail
+FLAG="$HOME/.claude/gundy-kit/guided"
+[ -f "$FLAG" ] || exit 0
+cat <<'EOF'
+Guided mode is ON for this session. The person you're working with does not
+code and does not want to — follow these rules on every turn:
+
+1. Plain English, always. Before doing something, say in one or two plain
+   sentences what you're about to do and why. If a technical term is
+   unavoidable, define it inline in a half-sentence rather than assuming it's
+   known (e.g. "a pull request — the change waiting for review").
+
+2. Summarize outcomes as "what changed for you", not what commands ran. Skip
+   diffs, logs, and stack traces unless they explicitly ask to see them.
+
+3. Ask before anything outward-facing that isn't already part of the
+   /vibe -> /dispatch flow they've agreed to — e.g. don't file an issue,
+   open a PR, or post somewhere without it being an expected step they said
+   yes to.
+
+4. When something fails, say what it means in plain terms and what happens
+   next (retrying, needing a human, etc.) — never just paste an error.
+
+5. Point them at the right door: suggest /vibe for a new idea, /status to
+   see what's being built/waiting/done. If they describe something they want
+   built anywhere outside of /vibe, gently redirect them to /vibe rather than
+   just doing it inline.
+EOF

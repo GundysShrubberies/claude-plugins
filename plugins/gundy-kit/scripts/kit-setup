@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+# kit-setup — idempotent one-time setup of a repo for gundy-kit's board
+# tooling: writes .kit/config.json, creates the two kit-* labels, then runs
+# kit-board check so the operator sees exactly what (if anything) is still
+# missing.
+#
+# This script deliberately does NOT create the GitHub Project itself — that
+# is the operator's call (they decide which board a repo's work lands on).
+# If the project doesn't exist yet, `kit-board check` (run at the end) says
+# so in plain English and stops there; re-run kit-setup once it exists.
+#
+# Usage:
+#   kit-setup --project-number N [--repo OWNER/name] [--project-owner OWNER]
+#
+#   --project-number N   required — the GitHub Project (Projects v2) number
+#                         the operator created for this repo's board. No
+#                         default is ever guessed.
+#   --repo OWNER/name    defaults to the current directory's repo (via
+#                         `gh repo view`).
+#   --project-owner OWNER  defaults to the repo's owner.
+#
+# Writes .kit/config.json at the repo root:
+#   {"repo":"OWNER/name","project_owner":"OWNER","project_number":N,
+#    "merge_allowlist":["OWNER/name"]}
+#
+# Exit codes: 0 ok (or non-zero from the final kit-board check — see there) ·
+# 64 usage / missing --project-number.
+set -euo pipefail
+
+usage() { sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+die() { echo "kit-setup: $1" >&2; exit "${2:-1}"; }
+
+REPO=""
+PROJECT_OWNER=""
+PROJECT_NUMBER=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --repo) [ $# -ge 2 ] || die "--repo needs a value" 64; REPO=$2; shift 2 ;;
+    --project-owner) [ $# -ge 2 ] || die "--project-owner needs a value" 64; PROJECT_OWNER=$2; shift 2 ;;
+    --project-number) [ $# -ge 2 ] || die "--project-number needs a value" 64; PROJECT_NUMBER=$2; shift 2 ;;
+    -h|--help) usage 0 ;;
+    *) die "unknown option '$1'" 64 ;;
+  esac
+done
+
+if [ -z "$REPO" ]; then
+  REPO=$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null || true)
+  [ -n "$REPO" ] || die "couldn't detect the repo from the current directory. Run this from inside the repo, or pass --repo OWNER/name." 64
+fi
+case "$REPO" in
+  */*) ;;
+  *) die "--repo must look like OWNER/name, got '$REPO'" 64 ;;
+esac
+
+[ -n "$PROJECT_OWNER" ] || PROJECT_OWNER="${REPO%%/*}"
+
+if [ -z "$PROJECT_NUMBER" ]; then
+  die "no --project-number given. A GitHub Project (Projects v2) has to exist first — that's the operator's call, not something this script guesses. Ask them for the project number, then run: kit-setup --project-number N" 64
+fi
+case "$PROJECT_NUMBER" in
+  ''|*[!0-9]*) die "--project-number must be a whole number, got '$PROJECT_NUMBER'" 64 ;;
+esac
+
+ROOT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+CONFIG_DIR="$ROOT/.kit"
+CONFIG_FILE="$CONFIG_DIR/config.json"
+mkdir -p "$CONFIG_DIR"
+jq -n --arg repo "$REPO" --arg owner "$PROJECT_OWNER" --argjson num "$PROJECT_NUMBER" \
+  '{repo:$repo, project_owner:$owner, project_number:$num, merge_allowlist:[$repo]}' > "$CONFIG_FILE"
+echo "Wrote $CONFIG_FILE"
+
+# Labels: idempotent, best-effort —
+# a create failure here (rate limit, transient error) must not abort setup;
+# kit-board check below reports a genuinely missing label.
+gh label create kit-working --color 1d76db --description "Claude is actively building this" --force --repo "$REPO" >/dev/null 2>&1 || true
+gh label create kit-needs-help --color b60205 --description "stuck — needs a human to unblock it" --force --repo "$REPO" >/dev/null 2>&1 || true
+
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+"$SCRIPT_DIR/kit-board" check

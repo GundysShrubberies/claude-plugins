@@ -140,3 +140,26 @@ if you added a manual `statusLine` entry per the section above, remove that
 line from `settings.json` too — a disabled plugin won't error if it's left in
 place (the command just won't be found), but it'll also stop showing anything
 useful.
+
+## Board & vibe-coding kit
+
+Everything below reads `.kit/config.json` at the root of your repo checkout:
+`{"repo", "project_owner", "project_number", "merge_allowlist"}`. There are no
+defaults. If the config is missing, the scripts stop and tell you why.
+
+- **`/start-here`**: first-run walkthrough. Checks GitHub login, clones the
+  workspace, sets up the board config, turns on guided mode, and walks you
+  through your first idea.
+- **`/vibe [what you want]`**: say what you want in your own words. Claude
+  asks a couple of plain-English questions, reads the plan back to you, and
+  queues it on the board.
+- **`/raise-issue <desc>`**: the technical version. Drafts a well-formed issue
+  and queues it in Approved.
+- **`/status`**: what's being built, what's stuck, and what's done.
+- **`/guided on|off|status`**: when on, every session explains each step in
+  plain English.
+- **`kit-setup --project-number N`**: one-time setup for a repo. Writes the
+  config, creates the `kit-working` and `kit-needs-help` labels, and checks the
+  board. It doesn't create the project board itself; ask Connor for that.
+- **`kit-board add|move|list|check`**: board operations. The Status options are
+  Backlog, Approved, In Progress, Needs help, and Done.

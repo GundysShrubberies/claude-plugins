@@ -1,0 +1,204 @@
+#!/usr/bin/env bash
+# claude-handoff — read/write the cross-session hand-off file at
+# ~/.claude/work-item/handoff.md (dotfiles#113). This exists so a session
+# approaching its context limit stops trusting `/compact` to preserve what
+# matters and instead writes down the load-bearing facts in plain text, for
+# either the next turn after compaction or a fresh session after `/clear`.
+#
+# Reuses claude-work-item's STATE_DIR (~/.claude/work-item) so both tools
+# share one directory instead of inventing a second state location.
+#
+# Expected body sections (the caller supplies these via stdin to `write`;
+# this script does not enforce their presence, only stamps a header on top):
+#   ## In flight       — open PRs/branches, their state, what's mid-step
+#   ## Decisions made   — choices already settled, so they are not re-litigated
+#   ## Next steps       — the ordered TODO for whoever reads this next
+#   ## Do-not-redo      — things tried, ruled out, or already done — the
+#                          number one purpose of this file: stop a fresh
+#                          session from re-doing (or re-trying a dead end)
+#                          work the previous one already finished or ruled out
+#
+# Store push: every `write` ALSO pushes the same body to the cross-machine
+# store (default GundysShrubberies/josh-tyler-handoffs, override
+# KIT_HANDOFF_REPO), through this plugin's kit-handoff script, as the slug
+# "<hostname>--session" (override: --slug or CLAUDE_HANDOFF_SLUG), so an
+# agent on any other machine can `kit-handoff pickup` it — that is the
+# whole push/pull mechanism: push on write, pull via `inbox` at session
+# start. Best effort by design: no kit-handoff on PATH, no network, no gh
+# auth → the local file is still written and one stderr line says the push
+# was skipped. CLAUDE_HANDOFF_NO_PUSH=1 disables the push (tests, offline).
+#
+# Usage:
+#   claude-handoff write [--session-id ID] [--slug S]   # body on stdin, writes atomically, pushes to the store
+#   claude-handoff read                       # prints the file if fresh
+#   claude-handoff inbox                      # SessionStart glue: prints the store's open handoffs; silent if none/unavailable
+#   claude-handoff fresh                      # exit 0 if a fresh file exists, 1 otherwise (no output)
+#   claude-handoff stale                      # exit 0 if missing or stale, 1 if fresh (no output)
+#   claude-handoff precompact-hook            # PreCompact hook glue (see below); stdin ignored
+#
+# Freshness: CLAUDE_HANDOFF_MAX_AGE_H (default 24) hours since `write`.
+#
+# Exit codes for `read`: 0 printed; 3 no file; 4 file exists but is stale.
+#
+# `precompact-hook` (dotfiles#113) is what settings.template.json's PreCompact
+# hook actually runs. It uses a much tighter freshness window than `read`/`stale`
+# — CLAUDE_PRECOMPACT_HANDOFF_MAX_AGE_H, default 0.25h (15 min) — because a
+# hand-off written hours ago by an earlier task is not evidence THIS compaction
+# is safe. Fresh: exits 0, no output, compaction proceeds. Stale or missing:
+# emits {decision:"block",reason:"..."} — the generic hook shape. (Until
+# 2026-09-11 this emitted hookSpecificOutput.permissionDecision, the
+# PreToolUse-only shape; Claude Code's hook-output validator rejected it
+# ("hookEventName: expected one of PreToolUse | ...") and the compaction
+# went ahead unguarded, so the block never fired even once.)
+# code.claude.com/docs/en/hooks.md: "On exit 2 or decision:block, Claude Code
+# cancels compaction and continues the conversation" — this is not a
+# warning-only best effort, the model is expected to write the hand-off and
+# try again.
+set -euo pipefail
+BIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+STATE_DIR="$HOME/.claude/work-item"
+FILE="$STATE_DIR/handoff.md"
+MAX_AGE_H="${CLAUDE_HANDOFF_MAX_AGE_H:-24}"
+
+usage() {
+  echo "usage: claude-handoff {write [--session-id ID] [--slug S]|read|inbox|fresh|stale}" >&2
+  exit 2
+}
+
+# store_client: prints the kit-handoff path, or nothing when it is not installed.
+# Prefers the copy shipped alongside this script (the plugin's scripts/ dir);
+# falls back to PATH for a manual install.
+store_client() {
+  if [ -x "$BIN_DIR/kit-handoff" ]; then echo "$BIN_DIR/kit-handoff"; return; fi
+  command -v kit-handoff 2>/dev/null || true
+}
+
+# default_slug: "<hostname>--session", lower-cased and squeezed to the store's
+# kebab-case rule; one rolling hand-off per machine, overwritten on each write.
+default_slug() {
+  local h
+  h=$(hostname -s 2>/dev/null || hostname)
+  h=$(printf '%s' "$h" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9\n' '-' | sed -E 's/^-+//; s/-+$//')
+  printf '%s--session\n' "${h:-host}"
+}
+
+# with_timeout: bound a network call so a hung gh never stalls a write or a hook.
+with_timeout() {
+  if command -v timeout >/dev/null 2>&1; then timeout 20 "$@"; else "$@"; fi
+}
+
+# age_hours: prints the file's age in hours (float) on stdout; fails if the
+# file is missing or its mtime can't be read.
+age_hours() {
+  [ -f "$FILE" ] || return 1
+  local now mtime
+  now=$(date +%s)
+  # GNU first: on Linux, `stat -f %m FILE` fails on the format yet still prints a
+  # filesystem block to stdout, so a BSD-first chain captures that garbage plus
+  # the fallback epoch (found 2026-09-20: the PreCompact hook never saw a fresh
+  # file on Omarchy). BSD stat rejects -c cleanly, so the order below is safe.
+  mtime=$(stat -c %Y "$FILE" 2>/dev/null || stat -f %m "$FILE" 2>/dev/null) || return 1
+  [ -n "$mtime" ] || return 1
+  awk -v n="$now" -v m="$mtime" 'BEGIN { printf "%.4f", (n - m) / 3600 }'
+}
+
+# is_fresh: exit 0 if the file exists and is younger than MAX_AGE_H hours.
+is_fresh() {
+  local h
+  h=$(age_hours) || return 1
+  awk -v h="$h" -v max="$MAX_AGE_H" 'BEGIN { exit !(h < max) }'
+}
+
+cmd_write() {
+  local session_id="${CLAUDE_SESSION_ID:-}" slug="${CLAUDE_HANDOFF_SLUG:-}"
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --session-id) [ "$#" -ge 2 ] || usage; session_id="$2"; shift 2 ;;
+      --slug) [ "$#" -ge 2 ] || usage; slug="$2"; shift 2 ;;
+      *) echo "claude-handoff write: unknown flag $1" >&2; exit 2 ;;
+    esac
+  done
+  local body ts tmp
+  body=$(cat)
+  ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  mkdir -p "$STATE_DIR"
+  tmp=$(mktemp "$STATE_DIR/handoff.XXXXXX")
+  {
+    printf '# Hand-off\n'
+    printf -- '- Written: %s UTC\n' "$ts"
+    printf -- '- Session: %s\n' "${session_id:-unknown}"
+    printf '\n'
+    printf '%s\n' "$body"
+  } > "$tmp"
+  mv -f "$tmp" "$FILE"
+  echo "claude-handoff: wrote $FILE" >&2
+  push_to_store "${slug:-$(default_slug)}" "$body" "$ts"
+}
+
+# push_to_store <slug> <body> <ts>: mirror the hand-off into the cross-machine
+# store. Never fails the local write; every outcome is one stderr line.
+push_to_store() {
+  local slug=$1 body=$2 ts=$3 client err host
+  [ "${CLAUDE_HANDOFF_NO_PUSH:-}" = 1 ] && return 0
+  client=$(store_client)
+  [ -n "$client" ] || { echo "claude-handoff: store push skipped (kit-handoff not installed)" >&2; return 0; }
+  host=$(hostname -s 2>/dev/null || hostname)
+  err=$(mktemp)
+  if printf '%s\n' "$body" | with_timeout "$client" write "$slug" --title "Session hand-off from $host ($ts)" >/dev/null 2>"$err"; then
+    echo "claude-handoff: pushed to store as $slug (kit-handoff pickup $slug from any machine)" >&2
+  else
+    echo "claude-handoff: store push failed, local file kept — $(tail -n1 "$err")" >&2
+  fi
+  rm -f "$err"
+}
+
+# inbox: SessionStart hook glue. Prints the store's open hand-offs as context
+# for the new session; prints nothing (exit 0) when the store is unreachable,
+# the client is missing, or the inbox is empty, so the hook never blocks.
+cmd_inbox() {
+  cat >/dev/null 2>&1 || true  # consume the hook's stdin JSON; not needed
+  local client out
+  client=$(store_client)
+  [ -n "$client" ] || return 0
+  out=$(with_timeout "$client" list 2>/dev/null) || return 0
+  grep -q '^SLUG' <<<"$out" || return 0
+  # shellcheck disable=SC2016  # backticks are literal Markdown for the model
+  printf 'Cross-machine hand-off inbox (GundysShrubberies/josh-tyler-handoffs, or KIT_HANDOFF_REPO if set) has open hand-offs. If one is the work this session is for, claim it FIRST with `kit-handoff pickup <slug>` (or /pickup) — pickup archives it so no other machine takes it — then continue from its Next steps. Otherwise leave it.\n%s\n' "$out"
+}
+
+cmd_read() {
+  [ -f "$FILE" ] || { echo "claude-handoff: no hand-off file at $FILE" >&2; exit 3; }
+  if is_fresh; then
+    cat "$FILE"
+  else
+    echo "claude-handoff: hand-off at $FILE is stale (older than ${MAX_AGE_H}h)" >&2
+    exit 4
+  fi
+}
+
+cmd_precompact_hook() {
+  cat >/dev/null || true  # consume the PreCompact hook's stdin JSON; not needed
+  local max="${CLAUDE_PRECOMPACT_HANDOFF_MAX_AGE_H:-0.25}"
+  local save="$MAX_AGE_H"
+  MAX_AGE_H="$max"
+  if [ -f "$FILE" ] && is_fresh; then
+    MAX_AGE_H="$save"
+    return 0
+  fi
+  MAX_AGE_H="$save"
+  jq -cn --arg r "No hand-off written in the last ${max}h. Write one first: $BIN_DIR/claude-handoff write (sections: In flight, Decisions made, Next steps, Do-not-redo), then compact again." \
+    '{decision:"block",reason:$r}'
+}
+
+cmd="${1:-}"
+shift || true
+case "$cmd" in
+  write)            cmd_write "$@" ;;
+  read)             cmd_read ;;
+  inbox)            cmd_inbox ;;
+  fresh)            [ -f "$FILE" ] && is_fresh ;;
+  stale)            ! { [ -f "$FILE" ] && is_fresh; } ;;
+  precompact-hook)  cmd_precompact_hook ;;
+  *) usage ;;
+esac

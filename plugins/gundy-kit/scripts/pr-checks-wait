@@ -1,0 +1,616 @@
+#!/usr/bin/env bash
+# pr-checks-wait — block (bounded) until every check on a PR's head SHA settles.
+#
+# Why this exists: a build worker that waits on CI turn-by-turn is the single
+# biggest usage sink in the fleet. One /dispatch-approved worker spent two hours
+# and ~2,700 turns (context grew to 750k tokens) emitting no-op `true` calls
+# between polls, because foreground `sleep` is blocked and background Monitor
+# leaves a subagent with nothing to do but idle. Waiting must be ONE foreground
+# tool call that sleeps inside the shell, not one turn per poll.
+#
+# Usage:
+#   pr-checks-wait <pr-number> -R <owner/repo> [--max-seconds N] [--interval N]
+#                  [--stall-minutes N] [--max-run-min N] [--head SHA]
+#
+# Call it from Claude with `timeout: 600000` (the Bash tool's cap). The default
+# --max-seconds fits under that cap; on exit 2 simply call it again — each call
+# costs one turn regardless of how long CI takes.
+#
+# Exit codes:
+#   0  settled, every check SUCCESS / SKIPPED / NEUTRAL (green)
+#   1  settled, at least one check not green (red) — the offenders are printed
+#   2  deadline reached with checks still pending — call again
+#   3  no checks listed on the rollup (reserved; see the empty-rollup grace
+#      window below — an empty rollup now waits before giving up rather than
+#      exiting this immediately)
+#   4  GitHub API kept failing until the deadline (rate limit, outage) — NOT an
+#      empty rollup; the last error is printed. On a rate limit the script
+#      already slept toward the published reset, so just call again.
+#   5  the self-hosted runner looks down or wedged: nothing is moving and more
+#      waiting cannot fix it. STOP — report an infrastructure blocker and do not
+#      call pr-checks-wait again until the runner is back.
+#   6  a specific check has been IN_PROGRESS longer than its per-name budget —
+#      a `HEALTH: <check> running <m> min (budget <b>) on <runner> — <job url>`
+#      line is printed. Unlike case 5 (queue-wide contention vs. a wedge),
+#      this is one job that itself is hung on a runner that is otherwise
+#      fine. STOP — report it as an infrastructure blocker (the HEALTH line
+#      carries the job url for `gh run view <run-id> --log-failed`) and do
+#      not call pr-checks-wait again for this PR until investigated.
+#
+# Running-past-budget detector (added 2026-09-10): a
+# check-run's own `in_progress` status only means GitHub accepted the job,
+# not that it is making progress — a hung job step (a device flash that never
+# returns, a demo server that never exits) sits IN_PROGRESS indefinitely and
+# looks identical to healthy long-running work, so case 5's stall detector
+# (which only fires on QUEUED-with-nothing-running) never catches it. Every
+# poll, any check-run whose status is `in_progress` is compared against a
+# per-name-prefix budget, in minutes: `demo*` 15, `qa*` 30, `review*` 20,
+# anything else 25. `--max-run-min N` overrides every check regardless of
+# name; short of that, `PR_CHECKS_BUDGETS` (a comma-separated
+# `prefix=minutes` list, e.g. `demo=15,qa=30,review=20`) overrides the
+# default for a matching prefix only — an unmatched name still floors to 25.
+# The runner name in the HEALTH line comes from the check-run's `html_url`
+# (`.../actions/runs/<run-id>/job/<job-id>`) resolved via one
+# `gh api repos/<r>/actions/jobs/<job-id>` call, read only once a check is
+# already over budget (the common green/pending path never pays for it);
+# any failure along that path (no job id in the url, API error, missing
+# field) prints "unknown" rather than blocking the HEALTH line on it.
+#
+# REST, not GraphQL (added 2026-09-04): the rollup used to
+# come from `gh pr view --json statusCheckRollup`, which is GraphQL under the
+# hood and shares one 5000-point/hour budget across every concurrent worker in
+# the fleet — a drained bucket stalls everything, not just this script. The
+# head SHA is now resolved once per invocation via REST
+# (`GET repos/{slug}/pulls/{pr}`) and cached, and each poll reads
+# `GET commits/{sha}/check-runs` (GitHub Actions + most third-party checks) and
+# `GET commits/{sha}/status` (the legacy commit-status API some external CI
+# still posts to) instead. `rate_reset_wait` follows suit and reads the REST
+# core bucket (`.resources.core.reset`), not the GraphQL one — this script no
+# longer touches GraphQL at all, so a GraphQL-only outage or a budget drained
+# by other workers no longer blocks it.
+#
+# Stale-head fix (added 2026-09-11): the head SHA used to
+# be resolved once per invocation and cached for the whole wait, so a
+# `pr-merge --update` push that landed mid-wait went undetected — the script
+# kept polling the OLD SHA's rollup, which could already be fully green (or
+# empty), and reported GREEN on a commit that was no longer the PR's head.
+# Two changes fix this:
+#   - The head SHA is now re-resolved every poll (in the main loop, not inside
+#     a `$(...)` subshell whose cache write would be lost). When it differs
+#     from the previous poll's SHA, the settle-tracking state (pending/queued
+#     timers, the running-past-budget probe alternator, the empty-rollup
+#     grace timer, and the printed summary dedup) is reset and a note is
+#     printed — the wait effectively restarts against the new head, never
+#     silently finishing against the old one.
+#   - `--head <sha>` pins the head SHA outright, skipping the per-poll
+#     `GET .../pulls/<n>` lookup entirely (and the drift-restart logic, since
+#     a pinned SHA cannot drift) — for a caller (e.g. `pr-merge --update`)
+#     that already knows the exact commit it wants settled.
+# A rollup with zero check-runs is no longer read as "no CI" on the spot
+# either: it is now PENDING for up to a grace window (default 120s, env
+# `PR_CHECKS_EMPTY_GRACE_SECONDS`), since checks can take a few seconds to
+# register on a brand-new head — only past that window does it give up, via
+# exit 2 (not exit 3 — the caller treats exit 2 identically to any other
+# "still pending, call again" case) naming the SHA that never got any checks.
+#
+# Rollup dedup, latest run wins (added 2026-09-04): a rerun
+# leaves the original run's row in place on the same SHA — e.g. a CANCELLED
+# check with a same-name SUCCESS sibling from the rerun. Treating that as red
+# (or even pending) is wrong once the rerun has concluded, so rows are grouped
+# by check name and only the most recent survives.
+#
+# Dedup key is check-run `id`, not timestamp (fixed 2026-09-22,
+# a past fleet incident — mirrors the same fix made elsewhere in that fleet's
+# merge tooling): a stale RED check-run from an old workflow run, with
+# a fresh same-name run still QUEUED (started_at not yet set — a check-run
+# only gets a `started_at` once it actually starts), used to sort as "newest"
+# because the old FAILURE's real timestamp string sorted after the new run's
+# empty one — a worker polling the PR then saw the stale red row, fast-exited,
+# and had to be re-polled by hand (14 times on one real PR). `id`
+# is assigned once at check-run creation, is always present, and only ever
+# increases, so it orders "old run vs. fresh retrigger/rerun" correctly
+# whether the fresh run is QUEUED, IN_PROGRESS, or already concluded. Legacy
+# commit-status rows carry no id (the TSV fills in `0` for all of them), so
+# ties there — multiple statuses under the same context name — fall back to
+# the timestamp, same as before this fix.
+#
+# Runner-stall detection (exit 5, added 2026-09-03 after a self-hosted runner host
+# wedged — sshd resetting connections, load 19, CI jobs stuck in "Set up
+# job" for 15 minutes before failing — while six workers each sat here for their
+# full deadline, repeatedly, on infrastructure they cannot fix). With checks
+# still pending, a stall is called when any of these holds:
+#   a) every pending check is QUEUED/PENDING — nothing IN_PROGRESS — and has been
+#      for longer than --stall-minutes (default 5, env PR_CHECKS_STALL_MINUTES);
+#   b) every self-hosted runner registered on the repo whose labels match
+#      PR_CHECKS_RUNNER_LABEL (default self-hosted) is offline. Repos with no
+#      self-hosted runners, and tokens that cannot read the endpoint, are skipped;
+#   c) a pending run's job has sat in its "Set up job" step for longer than
+#      --stall-minutes — the exact signature of the wedged host.
+# Org-busy probe (added 2026-09-04): case (a) alone cannot
+# tell queue contention from a wedge — an org-level runner shared across repos
+# can leave every check on THIS PR sitting QUEUED for a long time just because
+# it is busy running someone else's job, and that is not a reason to give up.
+# Before treating (a) as a stall, this script reads
+# `GET orgs/<org>/actions/runners` (org derived from -R's owner) and, if any
+# runner matching PR_CHECKS_RUNNER_LABEL is online and busy, treats that as
+# contention rather than evidence of a wedge and keeps waiting instead of
+# exiting 5. Silent (no suppression) when the endpoint is unreadable or no
+# runner matches — same fail-open posture as the other REST probes. This does
+# not apply to (c): a job already assigned to a runner and stuck in "Set up
+# job" is unambiguous evidence regardless of what else that runner is doing.
+# Cost: the common green/red path (nothing pending) makes no extra API call at
+# all, and no probe runs until checks have been pending for longer than the stall
+# window; after that it is at most one extra call per poll (two for case (a),
+# the org-busy probe plus the repo-offline probe, only when the first is empty).
+# --stall-minutes 0 turns the detector off; fractional minutes are allowed (the
+# tests use 0.02).
+set -euo pipefail
+
+PR=""
+REPO=""
+MAX_SECONDS=570
+INTERVAL=30
+STALL_MINUTES="${PR_CHECKS_STALL_MINUTES:-5}"
+RUNNER_LABEL="${PR_CHECKS_RUNNER_LABEL:-self-hosted}"
+MAX_RUN_MIN=""
+HEAD_PIN=""
+EMPTY_GRACE_SECONDS="${PR_CHECKS_EMPTY_GRACE_SECONDS:-120}"
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -R|--repo) REPO="$2"; shift 2 ;;
+    --max-seconds) MAX_SECONDS="$2"; shift 2 ;;
+    --interval) INTERVAL="$2"; shift 2 ;;
+    --stall-minutes) STALL_MINUTES="$2"; shift 2 ;;
+    --max-run-min) MAX_RUN_MIN="$2"; shift 2 ;;
+    --head) HEAD_PIN="$2"; shift 2 ;;
+    -h|--help) sed -n '2,105p' "$0"; exit 0 ;;
+    *) if [ -z "$PR" ]; then PR="$1"; shift; else echo "unexpected argument: $1" >&2; exit 64; fi ;;
+  esac
+done
+
+if [ -z "$PR" ]; then
+  echo "usage: pr-checks-wait <pr-number> -R <owner/repo> [--max-seconds N] [--interval N] [--stall-minutes N] [--max-run-min N] [--head SHA]" >&2
+  exit 64
+fi
+
+# Minutes may be fractional (the tests want a sub-second window); bash arithmetic
+# cannot divide, so normalise to whole seconds once, here.
+stall_secs=$(awk -v m="$STALL_MINUTES" 'BEGIN { s = m * 60; if (s < 0) s = 0; printf "%d", s }')
+
+# owner/repo for the REST calls, resolved once. Empty when it cannot be resolved,
+# which simply disables the probes (and, for the rollup itself, surfaces as an
+# API error at the call site).
+repo_slug_cache=""
+repo_slug() {
+  if [ -z "$repo_slug_cache" ]; then
+    if [ -n "$REPO" ]; then
+      repo_slug_cache="$REPO"
+    else
+      repo_slug_cache=$(gh repo view --json nameWithOwner --jq .nameWithOwner 2>/dev/null || true)
+      [ -n "$repo_slug_cache" ] || repo_slug_cache="-"
+    fi
+  fi
+  [ "$repo_slug_cache" = "-" ] && return 0
+  printf '%s' "$repo_slug_cache"
+}
+
+# Head SHA — resolved FRESH every call (this used to be
+# resolved once per invocation and cached for the whole wait, which is how a
+# `pr-merge --update` push landing mid-wait went undetected). `--head` pins
+# the SHA outright and skips the network call entirely. Callers that need the
+# per-poll drift check must call this once per poll from the main loop (a
+# plain shell variable assignment, not inside a `$(...)` subshell) and compare
+# against the previous poll's value themselves — this function itself holds
+# no cache to go stale.
+resolve_head_sha() {
+  if [ -n "$HEAD_PIN" ]; then
+    printf '%s' "$HEAD_PIN"
+    return 0
+  fi
+  local slug sha
+  slug=$(repo_slug)
+  [ -n "$slug" ] || return 1
+  sha=$(gh api "repos/${slug}/pulls/${PR}" --jq '.head.sha' 2>/dev/null) || return 1
+  [ -n "$sha" ] || return 1
+  printf '%s' "$sha"
+}
+
+# Groups TSV rows (verdict, name, url, timestamp, id) by name and keeps only the
+# most recent per name (by id, falling back to timestamp for id ties — see the
+# header comment) — a rerun's row wins over the original's, so a CANCELLED
+# check with a same-name SUCCESS sibling on the same SHA counts as green, and a
+# fresh same-name run that is only QUEUED still wins over an old run's RED
+# conclusion. Emits (verdict, name, url, timestamp) — the timestamp survives so
+# the running-past-budget detector can measure an IN_PROGRESS row's age.
+dedup_latest() {
+  jq -R -rs '
+    split("\n") | map(select(length > 0)) | map(split("\t"))
+    | group_by(.[1])
+    | map(sort_by([(.[4] | tonumber), .[3]]) | last)
+    | .[] | "\(.[0])\t\(.[1])\t\(.[2])\t\(.[3])"
+  '
+}
+
+# One line per check: "<verdict>\t<name>\t<url>\t<timestamp>". Verdict is the
+# conclusion once a check has concluded, else its live status. Two REST
+# sources are combined: check-runs (GitHub Actions and most third-party
+# checks) and the legacy commit status API (some external CI still posts
+# there instead). See the header comment for why this replaced
+# `gh pr view --json statusCheckRollup`. The timestamp is the check-run's
+# `started_at` (or the status's `updated_at`) — only meaningful for an
+# IN_PROGRESS row, which can only come from a check-run (the legacy status
+# API has no "in_progress" state).
+rollup() {
+  local sha="$1" slug
+  slug=$(repo_slug)
+  if [ -z "$slug" ]; then
+    echo "could not resolve repo slug for PR #${PR}" >&2
+    return 1
+  fi
+  if [ -z "$sha" ]; then
+    echo "could not resolve head SHA for PR #${PR}" >&2
+    return 1
+  fi
+  local checkruns statuses
+  # shellcheck disable=SC2016  # $v is a jq variable, not a shell one
+  checkruns=$(gh api "repos/${slug}/commits/${sha}/check-runs" --paginate --jq '
+      .check_runs[]
+      | (([.conclusion, .status] | map(select(. != null and . != "")) | first) // "UNKNOWN") as $v
+      | [ ($v | ascii_upcase), (.name // "?"), (.html_url // ""), (.started_at // .completed_at // ""), (.id | tostring) ]
+      | @tsv') || return 1
+  # shellcheck disable=SC2016  # $v is a jq variable, not a shell one
+  statuses=$(gh api "repos/${slug}/commits/${sha}/status" --jq '
+      .statuses[]
+      | ((.state // "UNKNOWN")) as $v
+      | [ ($v | ascii_upcase), (.context // "?"), (.target_url // ""), (.updated_at // .created_at // ""), "0" ]
+      | @tsv') || return 1
+  { [ -n "$checkruns" ] && printf '%s\n' "$checkruns"; [ -n "$statuses" ] && printf '%s\n' "$statuses"; true; } | dedup_latest
+}
+
+is_green()   { case "$1" in SUCCESS|SKIPPED|NEUTRAL) return 0 ;; *) return 1 ;; esac; }
+is_pending() { case "$1" in PENDING|QUEUED|IN_PROGRESS|WAITING|REQUESTED|EXPECTED|UNKNOWN|"") return 0 ;; *) return 1 ;; esac; }
+# Queued-like: accepted by GitHub but not started. WAITING/REQUESTED are excluded —
+# those mean a human gate (deployment approval), which is not a runner stall.
+is_queued()  { case "$1" in PENDING|QUEUED|UNKNOWN|"") return 0 ;; *) return 1 ;; esac; }
+
+deadline=$(( $(date +%s) + MAX_SECONDS ))
+last_summary=""
+prev_sha=""
+empty_since=""
+
+# Evidence line when every self-hosted runner the repo registers is offline.
+# Silent (not an error) when the endpoint is unreadable — the token often lacks
+# admin — or when the repo registers no self-hosted runners at all.
+runners_offline_note() {
+  local slug json total off names
+  slug=$(repo_slug)
+  [ -n "$slug" ] || return 0
+  json=$(gh api "repos/${slug}/actions/runners" 2>/dev/null) || return 0
+  [ -n "$json" ] || return 0
+  IFS=$'\t' read -r total off names <<<"$(jq -r --arg lbl "$RUNNER_LABEL" '
+      ([.runners[]?] | map(select(any(.labels[]?.name // ""; test($lbl; "i"))))) as $m
+      | (if ($m | length) > 0 then $m else [.runners[]?] end) as $r
+      | [ ($r | length)
+        , ($r | map(select((.status // "") != "online")) | length)
+        , ($r | map(.name // "?") | join(", "))
+        ] | @tsv' <<<"$json" 2>/dev/null || true)" || true
+  [ "${total:-0}" -gt 0 ] 2>/dev/null || return 0
+  if [ "${off:-0}" -eq "$total" ]; then
+    echo "all ${total} self-hosted runner(s) on ${slug} are offline (${names})"
+  fi
+}
+
+# Evidence AGAINST a stall when the org-level runner pool (not just this repo's)
+# has a runner matching PR_CHECKS_RUNNER_LABEL that is online and busy — i.e.
+# it is tied up running someone else's job, not down. That distinguishes queue
+# contention (more waiting can still help) from a wedge. Silent when the
+# endpoint is unreadable or no runner matches. See header comment.
+org_busy_note() {
+  local slug org json note
+  slug=$(repo_slug)
+  [ -n "$slug" ] || return 0
+  org="${slug%%/*}"
+  [ -n "$org" ] || return 0
+  json=$(gh api --method GET "orgs/${org}/actions/runners" 2>/dev/null) || return 0
+  [ -n "$json" ] || return 0
+  note=$(jq -r --arg lbl "$RUNNER_LABEL" '
+      ([.runners[]?] | map(select(any(.labels[]?.name // ""; test($lbl; "i"))))) as $m
+      | ($m | map(select((.status // "") == "online" and (.busy // false) == true))) as $busy
+      | if ($busy | length) > 0
+        then "org runner(s) online but busy with other work: " + ($busy | map(.name // "?") | join(", "))
+        else empty end' <<<"$json" 2>/dev/null || true)
+  [ -n "$note" ] || return 0
+  echo "$note"
+}
+
+# Evidence line when a job on <run-id> has been stuck in its "Set up job" step
+# longer than the stall window — a runner that accepted work and then died.
+setup_stall_note() {
+  local run=$1 slug json age
+  [ -n "$run" ] || return 0
+  slug=$(repo_slug)
+  [ -n "$slug" ] || return 0
+  json=$(gh api "repos/${slug}/actions/runs/${run}/jobs" 2>/dev/null) || return 0
+  [ -n "$json" ] || return 0
+  age=$(jq -r '
+      [ .jobs[]? | select(.status == "in_progress")
+        | .steps[]? | select(.name == "Set up job" and .status == "in_progress" and .started_at != null)
+        | (now - (.started_at | fromdateiso8601)) ] | max as $m
+      | if $m == null then empty else ($m | floor) end' <<<"$json" 2>/dev/null || true)
+  [ -n "$age" ] || return 0
+  [ "$age" -ge "$stall_secs" ] 2>/dev/null || return 0
+  echo "a job on run ${run} has been in its \"Set up job\" step for ${age}s"
+}
+
+# budget_override <prefix> — the minutes listed for <prefix> in
+# $PR_CHECKS_BUDGETS (a comma-separated "prefix=minutes" list, e.g.
+# "demo=15,qa=30,review=20"). Empty when the env var is unset or the prefix
+# is not one of its entries — the caller's own default then applies.
+budget_override() {
+  local prefix=$1 entry key val
+  [ -n "${PR_CHECKS_BUDGETS:-}" ] || return 0
+  IFS=',' read -ra _budget_entries <<< "$PR_CHECKS_BUDGETS"
+  for entry in "${_budget_entries[@]}"; do
+    key="${entry%%=*}"
+    val="${entry#*=}"
+    if [ "$key" = "$prefix" ] && [ -n "$val" ]; then
+      printf '%s' "$val"
+      return 0
+    fi
+  done
+}
+
+# budget_for_name <check-name> — minutes <check-name> may sit IN_PROGRESS
+# before it counts as past-budget. --max-run-min (global MAX_RUN_MIN)
+# overrides every check regardless of name. Otherwise a name is matched by
+# prefix against demo (default 15) / qa (default 30) / review (default 20),
+# each overridable via PR_CHECKS_BUDGETS; anything else floors to 25
+# (not overridable by prefix — there is no prefix to key it on).
+budget_for_name() {
+  local name=$1 prefix="" default=25 override
+  if [ -n "$MAX_RUN_MIN" ]; then
+    printf '%s' "$MAX_RUN_MIN"
+    return 0
+  fi
+  case "$name" in
+    demo*) prefix=demo; default=15 ;;
+    qa*) prefix=qa; default=30 ;;
+    review*) prefix=review; default=20 ;;
+  esac
+  if [ -n "$prefix" ]; then
+    override=$(budget_override "$prefix")
+    if [ -n "$override" ]; then
+      printf '%s' "$override"
+      return 0
+    fi
+  fi
+  printf '%s' "$default"
+}
+
+# runner_name_for_url <job-url> — the runner a job ran on, resolved from a
+# check-run's html_url (.../actions/runs/<run-id>/job/<job-id>) via one
+# `gh api repos/<r>/actions/jobs/<job-id>` call. Only reached once a check is
+# already over budget, so the common green/pending path never pays for it.
+# "unknown" on any failure along the way (no job id in the url, API error,
+# missing field) — cosmetic evidence for a HEALTH line, never a reason to
+# block on it.
+runner_name_for_url() {
+  local url=$1 slug job_id name
+  job_id=$(sed -nE 's#.*/job/([0-9]+).*#\1#p' <<<"$url")
+  if [ -z "$job_id" ]; then
+    printf 'unknown'
+    return 0
+  fi
+  slug=$(repo_slug)
+  if [ -z "$slug" ]; then
+    printf 'unknown'
+    return 0
+  fi
+  name=$(gh api "repos/${slug}/actions/jobs/${job_id}" --jq '.runner_name // empty' 2>/dev/null) || name=""
+  if [ -n "$name" ]; then
+    printf '%s' "$name"
+  else
+    printf 'unknown'
+  fi
+}
+
+# check_budget <name> <started-at> <url> — exits 6 with a HEALTH line the
+# moment an IN_PROGRESS check has run longer than its budget (see the header
+# comment). A no-op (falls through) while still under budget, or when
+# <started-at> cannot be parsed. Age is computed via jq's fromdateiso8601,
+# not shell `date -d`/`date -j`, to stay portable across GNU/BSD date (same
+# approach as setup_stall_note above).
+check_budget() {
+  local name=$1 started=$2 url=$3 budget elapsed_min runner
+  [ -n "$started" ] || return 0
+  budget=$(budget_for_name "$name")
+  [ -n "$budget" ] || return 0
+  elapsed_min=$(jq -n --arg s "$started" '
+      (((now - ($s | fromdateiso8601)) / 60) | floor)' 2>/dev/null) || return 0
+  [ -n "$elapsed_min" ] || return 0
+  [ "$elapsed_min" -ge "$budget" ] 2>/dev/null || return 0
+  runner=$(runner_name_for_url "$url")
+  echo "HEALTH: ${name} running ${elapsed_min} min (budget ${budget}) on ${runner} — ${url}"
+  exit 6
+}
+
+# Seconds until GitHub's REST core rate-limit window resets; empty when unknown.
+# Reads the core bucket, not the graphql one — this script is REST-only now, so
+# graphql's budget (shared and drained by every other worker in the fleet) is
+# irrelevant to it.
+rate_reset_wait() {
+  local reset now
+  reset=$(gh api --method GET rate_limit --jq '.resources.core.reset' 2>/dev/null || true)
+  [ -n "$reset" ] || return 0
+  now=$(date +%s)
+  [ "$reset" -gt "$now" ] 2>/dev/null && echo $(( reset - now ))
+}
+
+pending_since=""
+queued_only_since=""
+probe=0
+
+while :; do
+  total=0; pending=0; queued=0; red=0; red_list=""; pending_run=""
+  # Re-resolve the head SHA every poll (a past fleet incident) — never reuse a
+  # cached value across polls. A failure here is handled exactly like an API
+  # failure from rollup() itself (same backoff/retry/exit-4-at-deadline path).
+  if ! sha=$(resolve_head_sha 2>&1); then
+    rollup_out="could not resolve head SHA for PR #${PR}"
+    sha=""
+  elif [ -n "$prev_sha" ] && [ "$sha" != "$prev_sha" ]; then
+    # The head moved mid-wait (e.g. `pr-merge --update` pushed a merge
+    # commit) — restart the settle state against the new head rather than
+    # keep trusting timers/dedup state gathered against the old one.
+    echo "$(date -u +%H:%M:%SZ) head SHA changed ${prev_sha} -> ${sha} — restarting settle wait"
+    pending_since=""
+    queued_only_since=""
+    probe=0
+    empty_since=""
+    last_summary=""
+  fi
+  prev_sha="$sha"
+  # An API failure is not an empty rollup. Back off inside this call: on a rate
+  # limit sleep toward the published reset, otherwise retry on the normal
+  # interval; give up with exit 4 at the deadline.
+  if [ -z "$sha" ] || ! rollup_out=$(rollup "$sha" 2>&1); then
+    err=$(head -1 <<<"$rollup_out")
+    now=$(date +%s)
+    if [ "$now" -ge "$deadline" ]; then
+      echo "APIERR: GitHub API failing at deadline on PR #${PR}: ${err}"
+      echo "call again (after the rate-limit reset if that is the cause)"
+      exit 4
+    fi
+    nap=$INTERVAL
+    if grep -qi 'rate limit' <<<"$err"; then
+      until_reset=$(rate_reset_wait || true)
+      [ -n "$until_reset" ] && nap=$(( until_reset + 5 ))
+    fi
+    [ "$nap" -gt $(( deadline - now )) ] && nap=$(( deadline - now ))
+    [ "$nap" -lt 1 ] && nap=1
+    if [ "$err" != "$last_summary" ]; then
+      echo "$(date -u +%H:%M:%SZ) API error: ${err} — backing off ${nap}s inside this call"
+      last_summary="$err"
+    fi
+    sleep "$nap"
+    continue
+  fi
+  while IFS=$'\t' read -r verdict name url started; do
+    [ -z "$verdict" ] && continue
+    total=$((total + 1))
+    if is_pending "$verdict"; then
+      pending=$((pending + 1))
+      is_queued "$verdict" && queued=$((queued + 1))
+      # The run id behind a pending check, for the "Set up job" probe below.
+      if [ -z "$pending_run" ]; then
+        pending_run=$(sed -nE 's#.*/actions/runs/([0-9]+).*#\1#p' <<<"$url")
+      fi
+      # Running-past-budget check (see header): only IN_PROGRESS can mean a
+      # hung job step — QUEUED/PENDING is covered by the stall detector
+      # instead. Exits 6 directly the moment one is found over budget.
+      if [ "$verdict" = "IN_PROGRESS" ]; then
+        check_budget "$name" "$started" "$url"
+      fi
+    elif ! is_green "$verdict"; then
+      red=$((red + 1))
+      # The URL is .../actions/runs/<run-id>/job/<job-id>: enough for
+      # `gh run view <run-id> --log-failed` without any further status read.
+      red_list="${red_list}  ${name}: ${verdict}  ${url}"$'\n'
+    fi
+  done <<<"$rollup_out"
+
+  summary="checks=${total} pending=${pending} red=${red}"
+  if [ "$summary" != "$last_summary" ]; then
+    echo "$(date -u +%H:%M:%SZ) ${summary}"
+    last_summary="$summary"
+  fi
+
+  if [ "$total" -eq 0 ]; then
+    # Empty rollup: never trust this as GREEN, but don't give up instantly
+    # either — a brand-new head SHA's checks can take a few seconds to
+    # register (a past fleet incident). Wait out a grace window, keyed to THIS
+    # sha (reset above whenever the head changes), before giving up.
+    now=$(date +%s)
+    [ -n "$empty_since" ] || empty_since=$now
+    elapsed=$(( now - empty_since ))
+    if [ "$elapsed" -ge "$EMPTY_GRACE_SECONDS" ]; then
+      echo "no checks registered yet on ${sha} after ${EMPTY_GRACE_SECONDS}s — call again"
+      exit 2
+    fi
+    note="no checks registered yet on ${sha} (${elapsed}s of ${EMPTY_GRACE_SECONDS}s grace) — waiting"
+    if [ "$note" != "$last_summary" ]; then
+      echo "$(date -u +%H:%M:%SZ) ${note}"
+      last_summary="$note"
+    fi
+    if [ "$(date +%s)" -ge "$deadline" ]; then
+      echo "PENDING: 0 of 0 checks registered on ${sha} after ${MAX_SECONDS}s — call again"
+      exit 2
+    fi
+    sleep "$INTERVAL"
+    continue
+  fi
+  empty_since=""
+
+  if [ "$pending" -eq 0 ]; then
+    if [ "$red" -eq 0 ]; then
+      echo "GREEN: all ${total} checks settled green on PR #${PR} at ${sha}"
+      exit 0
+    fi
+    echo "RED: ${red} of ${total} checks not green on PR #${PR}"
+    printf '%s' "$red_list"
+    exit 1
+  fi
+
+  # --- runner-stall detection (see header) -------------------------------------
+  # Only reached with work still pending, and only probes once that has been true
+  # for longer than the stall window, so the green/red path pays nothing.
+  now=$(date +%s)
+  [ -n "$pending_since" ] || pending_since=$now
+  if [ "$queued" -eq "$pending" ]; then
+    [ -n "$queued_only_since" ] || queued_only_since=$now
+  else
+    queued_only_since=""
+  fi
+
+  if [ "$stall_secs" -gt 0 ] && [ $(( now - pending_since )) -ge "$stall_secs" ]; then
+    evidence=""
+    if [ -n "$queued_only_since" ] && [ $(( now - queued_only_since )) -ge "$stall_secs" ]; then
+      # Before calling this a stall: is the org-level runner pool just busy with
+      # other work? That is contention, not a wedge — keep waiting.
+      busy_note=$(org_busy_note || true)
+      if [ -n "$busy_note" ]; then
+        note_summary="${busy_note} — contention, not a wedge; continuing to wait"
+        if [ "$note_summary" != "$last_summary" ]; then
+          echo "$(date -u +%H:%M:%SZ) ${note_summary}"
+          last_summary="$note_summary"
+        fi
+      else
+        evidence="all ${pending} pending check(s) still QUEUED/PENDING with nothing in progress for $(( now - queued_only_since ))s"
+        note=$(runners_offline_note || true)
+        if [ -n "$note" ]; then evidence="${evidence}; ${note}"; fi
+      fi
+    else
+      # Something claims to be running. Alternate the two probes so a poll never
+      # costs more than one extra API call.
+      probe=$(( probe + 1 ))
+      if [ $(( probe % 2 )) -eq 1 ]; then
+        note=$(setup_stall_note "$pending_run" || true)
+      else
+        note=$(runners_offline_note || true)
+      fi
+      if [ -n "$note" ]; then evidence="$note"; fi
+    fi
+    if [ -n "$evidence" ]; then
+      echo "STALLED: self-hosted runner appears down/wedged — ${evidence}"
+      echo "Stop waiting. Report this as an infrastructure blocker; do not retry pr-checks-wait until the runner is back."
+      exit 5
+    fi
+  fi
+
+  if [ "$(date +%s)" -ge "$deadline" ]; then
+    echo "PENDING: ${pending} of ${total} checks still running after ${MAX_SECONDS}s — call again"
+    exit 2
+  fi
+  sleep "$INTERVAL"
+done

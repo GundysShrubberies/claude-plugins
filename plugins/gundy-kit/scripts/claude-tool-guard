@@ -1,0 +1,244 @@
+#!/usr/bin/env bash
+# claude-tool-guard — PreToolUse hook (matcher: Bash|Monitor|Agent) that blocks
+# tool-call shapes that are known to waste turns and tokens, deterministically
+# and at zero model cost:
+#   1. CI waits parked in the background (`run_in_background: true` on gh run watch /
+#      pr-checks-wait, or the same command handed to Monitor). A worker that backgrounds
+#      the wait returns early and has to be resumed, replaying its whole context.
+#   2. No-op turns (`true`, `date`, bare `sleep N`) used to pass time.
+#   3. Sub-agents spawning sub-agents (Agent tool from inside a subagent transcript) —
+#      two agents sharing one working tree race each other.
+#   4. Hand-rolled CI polling: `gh run watch`, `gh pr checks --watch`, and
+#      `sleep N; gh ...` compounds instead of the bundled pr-checks-wait script.
+#      Blocking watchers are denied everywhere; in a subagent every CI status read
+#      and every sleep >= CLAUDE_WORKER_SLEEP_MAX (default 10 s) or sleep+gh compound
+#      is denied too, pointing at pr-checks-wait.
+# It also keeps a per-transcript tool-call counter under $TMPDIR/claude-tool-guard so
+# an external health check can spot a runaway worker. Two circuit breakers apply to
+# subagents only: CLAUDE_WORKER_TOOL_BUDGET (default 500 tool calls) and
+# CLAUDE_WORKER_REPEAT_MAX (default 15 — the same Bash command issued that many
+# times is a loop). Set either to 0 to disable.
+#
+# CONTEXT-WINDOW GUARD: three thresholds, checked via claude-context-gauge
+# against this call's transcript —
+#   CLAUDE_CONTEXT_WARN_PCT (default 50, any session): once per 10-point band,
+#     inject a non-blocking additionalContext message telling the model to wrap up
+#     the in-flight step and write a hand-off (claude-handoff write).
+#   CLAUDE_WORKER_CONTEXT_DENY_PCT (default 85, subagents only): deny the call,
+#     same shape as the tool-call budget above — "stop and return with STATUS:
+#     partial".
+#   CLAUDE_CONTEXT_RESET_PCT (default 80, main session only): the warn message
+#     becomes an instruction to stop taking new work and tell the user to /clear.
+#     The main session is NEVER denied — only a human decides to end their own
+#     session. Set any threshold to 0 to disable it.
+# The hand-off both messages point at lives at ~/.claude/work-item/handoff.md,
+# written and read via claude-handoff (write/read/fresh/stale) — see that
+# script's own header for the full mechanism.
+# Reset procedure for a human watching the main session hit 80%: let the current
+# batch finish, confirm the hand-off looks right, then run /clear and re-issue
+# the same instruction in the fresh session — it re-reads the hand-off at start.
+# A subagent's PreToolUse input carries the PARENT session's transcript_path. The
+# subagent's own turns are written to <parent-dir>/<session>/subagents/agent-<id>.jsonl,
+# so the guard gauges THAT file for a subagent call; if it does not exist yet the usage
+# is unknown (no warn, no deny) — it is never the parent's figure. One caveat
+# remains, straight from the platform docs (code.claude.com/docs/en/hooks.md):
+# "The transcript file is written asynchronously and may lag the in-memory
+# conversation," so the percentage is current as of the last flushed turn, not
+# necessarily this exact tool call.
+# Fail-open: any parse error allows the call (exit 0, no output).
+set -euo pipefail
+BIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+command -v jq >/dev/null 2>&1 || exit 0
+input=$(cat) || exit 0
+[ -n "$input" ] || exit 0
+
+tool=$(jq -r '.tool_name // empty' <<<"$input" 2>/dev/null) || exit 0
+[ -n "$tool" ] || exit 0
+transcript=$(jq -r '.transcript_path // empty' <<<"$input" 2>/dev/null || true)
+session=$(jq -r '.session_id // empty' <<<"$input" 2>/dev/null || true)
+agent_id=$(jq -r '.agent_id // empty' <<<"$input" 2>/dev/null || true)
+# Sub-agent calls carry agent_id/agent_type; transcript_path is the PARENT session's,
+# so it cannot be used to tell them apart. A transcript_path under .../subagents/ is
+# still honoured as a subagent signal for callers that pass one.
+in_subagent=0
+[ -n "$agent_id" ] && in_subagent=1
+case "$transcript" in */subagents/*) in_subagent=1 ;; esac
+# The transcript to GAUGE: a subagent's own file, resolved from the parent's path +
+# agent_id; empty (= unknown) when that file is not there yet.
+gauge_transcript="$transcript"
+if [ -n "$agent_id" ] && [ -n "$transcript" ]; then
+  sub_transcript="$(dirname "$transcript")/$(basename "$transcript" .jsonl)/subagents/agent-$agent_id.jsonl"
+  if [ -r "$sub_transcript" ]; then gauge_transcript="$sub_transcript"; else gauge_transcript=""; fi
+fi
+
+deny() {
+  jq -cn --arg r "$1" \
+    '{hookSpecificOutput:{hookEventName:"PreToolUse",permissionDecision:"deny",permissionDecisionReason:$r}}'
+  exit 0
+}
+
+# --- per-transcript call counter (feeds an external health check; budget optional) ----
+count_dir="${TMPDIR:-/tmp}/claude-tool-guard"
+key=${agent_id:-$(basename "${transcript:-$session}" .jsonl)}
+# Keep the last input's top-level keys + agent hints so the subagent-detection path can be
+# verified from outside (the hook input shape is not documented for sub-agents).
+if mkdir -p "$count_dir" 2>/dev/null; then
+  jq -c '{keys: keys, agent_id: (.agent_id // null), agent_type: (.agent_type // null), transcript: (.transcript_path // null), sid: (.session_id // null)}' <<<"$input" 2>/dev/null > "$count_dir/input-$key.json" || true
+fi
+if [ -n "$key" ] && mkdir -p "$count_dir" 2>/dev/null; then
+  f="$count_dir/$key.count"
+  n=$(( $(cat "$f" 2>/dev/null || echo 0) + 1 ))
+  printf '%s\n' "$n" > "$f" 2>/dev/null || true
+  budget="${CLAUDE_WORKER_TOOL_BUDGET:-500}"
+  if [ "$in_subagent" = 1 ] && [ "$budget" -gt 0 ] 2>/dev/null && [ "$n" -gt "$budget" ] 2>/dev/null; then
+    deny "Tool-call budget ($budget) exhausted for this worker. Stop and return now with STATUS: partial, the PR URL if one is open, and what remains."
+  fi
+fi
+
+# --- context-window guard -----------------------------------------------
+ctx_context_msg=""
+gauge_bin="$BIN_DIR/claude-context-gauge"
+if [ -x "$gauge_bin" ] && [ -n "$gauge_transcript" ]; then
+  gauge_out=$("$gauge_bin" "$gauge_transcript" 2>/dev/null) || gauge_out=""
+  if [ -n "$gauge_out" ]; then
+    ctx_pct=$(awk '{print $1}' <<<"$gauge_out")
+    warn_pct="${CLAUDE_CONTEXT_WARN_PCT:-50}"
+    worker_deny_pct="${CLAUDE_WORKER_CONTEXT_DENY_PCT:-85}"
+    reset_pct="${CLAUDE_CONTEXT_RESET_PCT:-80}"
+    if [ "$in_subagent" = 1 ] && [ "$worker_deny_pct" -gt 0 ] 2>/dev/null && [ "$ctx_pct" -ge "$worker_deny_pct" ] 2>/dev/null; then
+      deny "Context at ${ctx_pct}% (worker deny threshold ${worker_deny_pct}%). Stop and return now with STATUS: partial, the PR URL if one is open, and what remains."
+    fi
+    if [ "$warn_pct" -gt 0 ] 2>/dev/null && [ "$ctx_pct" -ge "$warn_pct" ] 2>/dev/null && [ -n "$key" ] && mkdir -p "$count_dir" 2>/dev/null; then
+      band=$(( ctx_pct / 10 * 10 ))
+      band_file="$count_dir/$key.ctxband"
+      last_band=$(cat "$band_file" 2>/dev/null || echo -1)
+      if [ "$band" != "$last_band" ]; then
+        printf '%s\n' "$band" > "$band_file" 2>/dev/null || true
+        if [ "$in_subagent" != 1 ] && [ "$reset_pct" -gt 0 ] 2>/dev/null && [ "$ctx_pct" -ge "$reset_pct" ] 2>/dev/null; then
+          ctx_context_msg="Context at ${ctx_pct}% (reset threshold ${reset_pct}%). Stop taking on new work: finish the current batch, write the hand-off ($BIN_DIR/claude-handoff write < body, covering In flight / Decisions made / Next steps / Do-not-redo), then end this turn telling the user to run /clear and start a fresh session."
+        else
+          ctx_context_msg="Context at ${ctx_pct}%. Finish the in-flight step, write the hand-off file ($BIN_DIR/claude-handoff write < body — see its header for the expected sections), then /compact or /clear."
+        fi
+      fi
+    fi
+  fi
+fi
+
+wait_hint="Wait with ONE foreground call instead: $BIN_DIR/pr-checks-wait <pr> -R <owner/repo> (timeout 600000; exit 0 green, 1 red with offenders printed, 2 still pending: call it again). If pr-checks-wait exits 5 the runner is down: stop and report it as an infrastructure blocker, do not retry. Never poll turn-by-turn."
+
+# Backgrounded/Monitor'd waits are matched loosely (the run_in_background flag or the
+# Monitor tool already narrows the shape).
+ci_wait_re='gh run watch|pr-checks-wait|gh pr checks[^|;&]*--watch|gh run view[^|;&]*--exit-status'
+noop_re='^[[:space:]]*(true|:|date|sleep[[:space:]]+[0-9.]+[smh]?)[[:space:]]*$'
+sleep_max="${CLAUDE_WORKER_SLEEP_MAX:-10}"
+repeat_max="${CLAUDE_WORKER_REPEAT_MAX:-15}"
+
+# Foreground rules must not fire on a command that merely MENTIONS gh/sleep (an rg
+# pattern, a commit message, an echo). So: strip quoted strings, then require the
+# word at command position — start of line or after ; & | ( ` then do, with any
+# number of leading VAR=value assignments.
+cp='(^|[;&|`(]|then[[:space:]]|do[[:space:]])[[:space:]]*([A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*[[:space:]]+)*'
+# Heredoc bodies (commit messages, PR bodies, file contents) are data too: drop every
+# line between a `<<TAG` opener and its terminator before matching. The opener's own
+# line is kept, so `gh run watch 1 <<EOF` is still seen.
+strip_heredocs() {
+  awk '
+    t != "" { if ($0 == t) t = ""; next }
+    { print }
+    match($0, /<<-?[ \t]*["'"'"']?[A-Za-z_][A-Za-z0-9_]*/) {
+      s = substr($0, RSTART, RLENGTH); sub(/<<-?[ \t]*["'"'"']?/, "", s); t = s
+    }' <<<"$1"
+}
+strip_quotes() { strip_heredocs "$1" | sed -E "s/\"[^\"]*\"//g; s/'[^']*'//g"; }
+# at_cmd <normalized> <word-regex>: is <word> a command in the normalized text?
+at_cmd() { grep -Eq "${cp}$2([[:space:]]|$)" <<<"$1"; }
+# Longest `sleep N` at command position (integer seconds; m/h suffixes count as long).
+max_sleep() {
+  { grep -Eo "${cp}sleep[[:space:]]+[0-9.]+[smh]?" <<<"$1" 2>/dev/null || true; } \
+    | awk '{v=$NF; if (v ~ /[mh]$/) {print 100000; next} sub(/s$/,"",v); printf "%d\n", v+0}' \
+    | sort -n | tail -1
+}
+
+case "$tool" in
+  Bash)
+    cmd=$(jq -r '.tool_input.command // empty' <<<"$input" 2>/dev/null || true)
+    bg=$(jq -r '.tool_input.run_in_background // false' <<<"$input" 2>/dev/null || echo false)
+    if [ "$bg" = "true" ] && grep -Eq "$ci_wait_re" <<<"$cmd"; then
+      deny "CI waits must block in the foreground: run $BIN_DIR/pr-checks-wait <pr> -R <owner/repo> with run_in_background false and timeout 600000 (call again on exit 2). Backgrounding it makes you return early and burns a resume."
+    fi
+    # Whole-command match (bash =~ has no per-line anchors), so a multi-line script
+    # that merely CONTAINS a line like `sleep 2` is not mistaken for a no-op turn.
+    if [[ "$cmd" =~ $noop_re ]]; then
+      deny "No-op turn blocked. If you are waiting on CI, call $BIN_DIR/pr-checks-wait in the foreground with timeout 600000; otherwise continue with real work or return."
+    fi
+    # pr-checks-wait sleeps up to 570 s; with the Bash tool's default 120 s timeout the
+    # call auto-backgrounds and the worker is back to idling.
+    # shellcheck disable=SC2016  # literal $HOME is part of the regex
+    if grep -Eq '(^|[;&|`(]|[[:space:]])(~/\.claude/bin/|\$HOME/\.claude/bin/)?pr-checks-wait([[:space:]]|$)' <<<"$cmd"; then
+      tmo=$(jq -r '.tool_input.timeout // 0' <<<"$input" 2>/dev/null || echo 0)
+      if [ "${tmo:-0}" -lt 590000 ] 2>/dev/null; then
+        deny "pr-checks-wait must be called with the Bash tool parameter timeout: 600000 (you passed ${tmo:-none}); otherwise the call auto-backgrounds at the default timeout and you idle. Re-issue the same command with timeout 600000."
+      fi
+    fi
+    norm=$(strip_quotes "$cmd")
+    # Blocking watchers: always worse than pr-checks-wait, denied in every session.
+    if at_cmd "$norm" 'gh[[:space:]]+run[[:space:]]+watch' \
+       || { at_cmd "$norm" 'gh[[:space:]]+pr[[:space:]]+checks' && grep -Eq -- '--watch' <<<"$cmd"; } \
+       || { at_cmd "$norm" 'gh[[:space:]]+run[[:space:]]+view' && grep -Eq -- '--exit-status' <<<"$cmd"; }; then
+      deny "Blocking CI watcher denied: it returns every Bash timeout and costs one turn per poll. $wait_hint"
+    fi
+    if [ "$in_subagent" = 1 ]; then
+      # Any CI status read: a worker has no reason to look at these except to poll.
+      # (`gh run view ... --log*` is reading a failed log to fix it — allowed.)
+      if at_cmd "$norm" 'gh[[:space:]]+pr[[:space:]]+checks' || at_cmd "$norm" 'gh[[:space:]]+run[[:space:]]+list' \
+         || { at_cmd "$norm" 'gh[[:space:]]+pr[[:space:]]+view' && grep -q statusCheckRollup <<<"$cmd"; } \
+         || { at_cmd "$norm" 'gh[[:space:]]+api' && grep -Eq 'check-runs|check-suites|/status([^[:alnum:]_-]|$)|/runs([^[:alnum:]_-]|$)' <<<"$cmd"; }; then
+        deny "CI status polling is not allowed in a worker. $wait_hint"
+      fi
+      if at_cmd "$norm" 'gh[[:space:]]+run[[:space:]]+view' && ! grep -Eq -- '--log' <<<"$cmd"; then
+        deny "gh run view without --log/--log-failed is a status poll. $wait_hint To read a failed job's output use gh run view <id> --log-failed."
+      fi
+      s=$(max_sleep "$norm" || true)
+      if [ -n "${s:-}" ]; then
+        if at_cmd "$norm" 'gh'; then
+          deny "sleep + gh in one command is a poll loop. $wait_hint"
+        fi
+        if [ "$sleep_max" -gt 0 ] 2>/dev/null && [ "$s" -ge "$sleep_max" ] 2>/dev/null; then
+          deny "sleep ${s}s in a worker is a wait turn. If you are waiting on CI: $wait_hint If a service needs time to start, poll it in the same command with a short loop instead of sleeping."
+        fi
+      fi
+      # Repeat breaker: the same command issued repeat_max times is a loop.
+      if [ "$repeat_max" -gt 0 ] 2>/dev/null && [ -n "$key" ] && [ -n "$cmd" ] && [ -d "$count_dir" ]; then
+        h=$(printf '%s' "$cmd" | tr -s '[:space:]' ' ' | cksum | cut -d' ' -f1)
+        cf="$count_dir/$key.cmds"
+        c=$( { grep -E "^$h " "$cf" 2>/dev/null || true; } | cut -d' ' -f2 | head -1)
+        c=$(( ${c:-0} + 1 ))
+        { grep -Ev "^$h " "$cf" 2>/dev/null; printf '%s %s\n' "$h" "$c"; } > "$cf.tmp" 2>/dev/null && mv -f "$cf.tmp" "$cf" 2>/dev/null || true
+        if [ "$c" -gt "$repeat_max" ]; then
+          deny "This exact command has now been issued $c times in this worker: that is a loop, not progress. If you are waiting on something: $wait_hint Otherwise change approach or return with STATUS: partial and what remains."
+        fi
+      fi
+    fi
+    ;;
+  Monitor)
+    if [ "$in_subagent" = 1 ]; then
+      deny "Subagents must not park waits on Monitor. Use $BIN_DIR/pr-checks-wait in the foreground with timeout 600000."
+    fi
+    if jq -r '.tool_input | tostring' <<<"$input" 2>/dev/null | grep -Eq "$ci_wait_re"; then
+      deny "CI waits must block in the foreground via $BIN_DIR/pr-checks-wait, not Monitor."
+    fi
+    ;;
+  Agent)
+    if [ "$in_subagent" = 1 ]; then
+      deny "Workers must not spawn sub-agents: two agents in one working tree race each other. Do every step yourself."
+    fi
+    ;;
+esac
+
+# The call is allowed: still surface a pending context-window notice, if any
+# (see the context-window guard above). Non-blocking — allow + additionalContext.
+if [ -n "$ctx_context_msg" ]; then
+  jq -cn --arg m "$ctx_context_msg" \
+    '{hookSpecificOutput:{hookEventName:"PreToolUse",permissionDecision:"allow",additionalContext:$m}}'
+fi
+exit 0

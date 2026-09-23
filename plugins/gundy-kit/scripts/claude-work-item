@@ -1,0 +1,267 @@
+#!/usr/bin/env bash
+# Track the work item the current Claude Code session is on, for the status line,
+# and record + announce its completion.
+#
+# State lives in ~/.claude/work-item/<key>.json. The key is, in order:
+#   1. an explicit -R/--repo together with an explicit issue, used verbatim
+#      (repo alone still collides two issues in the same repo, so both are
+#      required together) — the only way two callers sharing a cwd (e.g. both
+#      parked at $HOME) are guaranteed distinct files;
+#   2. else the git toplevel of the working directory, exactly as before;
+#   3. else (not a git dir) the bare cwd, exactly as before.
+# Tiers 2 and 3 are intentionally unchanged from today, so a bare `set` /
+# `clear` pair (no --repo) still round-trips through the same file regardless
+# of which issue is active. Automated callers (a custom workflow command,
+# a batch of subagent workers) should pass -R/--repo (and --issue, for clear)
+# explicitly to get the collision-proof tier-1 key; ad-hoc/manual invocations
+# keep working via the cwd-based fallback.
+#
+# A typical caller runs `set` the moment it opens an issue (phase looking), again
+# when it claims the issue (phase working), and again when the PR opens (phase
+# in-review). A SessionStart hook on source=clear calls `clear-hook` so /clear
+# resets the status line to its default. See scripts/claude-statusline.
+#
+# COMPLETION CARDS
+#   `done` is the one place a finished work item is announced. A caller runs it at
+#   hand-off with the synopsis fields; a batch of subagent workers running the
+#   same step produces one cue per item. It appends a JSON card to
+#   ~/.claude/work-item/log.jsonl, then fires `speak chime done "<one sentence>"`
+#   in the background — the caller never waits on the playback queue, and a
+#   missing `speak` never fails the caller (this plugin does not ship `speak`;
+#   install any CLI of that name on PATH to get the spoken cue, or ignore it).
+#   `recent [N]` prints the last N cards.
+#
+#   claude-work-item done -R NAME --issue 39 --outcome ready --pr URL --gate green \
+#     --tier ask --applied 2 --declined 1 --hoisted 1 \
+#     --next "review the PR" [--risk "..."]... [--note "..."] [--title T]
+#
+#   --outcome  ready | blocked | merged   (required)
+#   --next     the one thing the human should do now (spoken)
+#   --risk     repeatable; anything the reviewer should know going in
+#   --quiet    write the card, say nothing — subagent workers run quietly and
+#              let the orchestrating session speak for them (below)
+#   -R/--repo / --title default from the current directory and the state file.
+#
+#   claude-work-item announce -R NAME --issue 39
+#
+#   Speaks the newest card for that item — the same sentence `done` would have
+#   said — through the speak queue, and prints it. An orchestrating session runs
+#   this as it reconciles each quiet worker, so only top-level sessions talk.
+set -euo pipefail
+
+STATE_DIR="$HOME/.claude/work-item"
+
+# SHA-1 of stdin, first field only. macOS ships /usr/bin/shasum (perl); on
+# Linux that path is absent (Arch keeps it under /usr/bin/core_perl, often off
+# PATH in hooks), so fall back to coreutils sha1sum — same digest either way.
+sha1_key() {
+  if [ -x /usr/bin/shasum ]; then /usr/bin/shasum; else sha1sum; fi | cut -d' ' -f1
+}
+LOG="$STATE_DIR/log.jsonl"
+
+# Derive the state-file key. An explicit repo+issue pair (both required
+# together — repo alone doesn't disambiguate sibling issues) is used
+# verbatim, regardless of cwd. Otherwise this is exactly the old dir-only
+# key: the git toplevel of dir, or the bare dir when it isn't a repo.
+statefile() {
+  local dir="$1" repo="${2:-}" issue="${3:-}" key
+  if [ -n "$repo" ] && [ -n "$issue" ]; then
+    key="repo:${repo}#${issue}"
+  else
+    key=$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null || printf '%s' "$dir")
+  fi
+  printf '%s/%s.json' "$STATE_DIR" "$(printf '%s' "$key" | sha1_key)"
+}
+
+# Resolve the human-facing repo label with the same precedence as statefile():
+# an explicit --repo wins outright, else the git toplevel basename of dir,
+# else (non-git dir) the bare dir's basename.
+repo_name() {
+  local dir="${1:-$PWD}" repo="${2:-}" root
+  if [ -n "$repo" ]; then
+    printf '%s' "$repo"
+    return
+  fi
+  root=$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null || printf '%s' "$dir")
+  basename "$root"
+}
+
+# Compose the spoken line: outcome first, then the two numbers that matter, then
+# the human's next action. Hyphens become spaces so "my-repo" reads naturally.
+spoken_line() {
+  local repo="$1" issue="$2" outcome="$3" gate="$4" applied="$5" hoisted="$6" next="$7" risks="$8" note="${9:-}"
+  local said_repo="${repo//-/ }" s=""
+  case "$outcome" in
+    ready)   s="${said_repo} issue ${issue} is ready for review." ;;
+    merged)  s="${said_repo} issue ${issue} was auto merged." ;;
+    blocked)
+      local gate_phrase
+      case "$gate" in
+        green) gate_phrase="the gate is green but hand-off is blocked" ;;
+        red)   gate_phrase="the gate is red" ;;
+        *)     gate_phrase="hand-off is blocked" ;;
+      esac
+      s="${said_repo} issue ${issue} is blocked, ${gate_phrase}."
+      [ -n "$note" ] && s="$s Reason: ${note}."
+      ;;
+    *)       s="${said_repo} issue ${issue} finished with outcome ${outcome}." ;;
+  esac
+  local bits=()
+  [ -n "$gate" ] && [ "$outcome" != "blocked" ] && bits+=("gate ${gate}")
+  [ -n "$applied" ] && [ "$applied" != "0" ] && bits+=("${applied} review findings applied")
+  [ -n "$hoisted" ] && [ "$hoisted" != "0" ] && bits+=("${hoisted} hoisted as follow ups")
+  if [ "${#bits[@]}" -gt 0 ]; then
+    local joined; joined=$(printf ', %s' "${bits[@]}"); s="$s ${joined:2}."
+  fi
+  if [ "$risks" -eq 1 ]; then s="$s One risk is noted in the card."
+  elif [ "$risks" -gt 1 ]; then s="$s ${risks} risks are noted in the card."; fi
+  [ -n "$next" ] && s="$s Next, ${next}."
+  printf '%s' "$s"
+}
+
+cmd_done() {
+  local issue="" repo="" title="" outcome="" pr="" gate="" tier="" applied="" declined="" hoisted="" next="" note=""
+  local risks=()
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --issue)   issue="${2#\#}"; shift 2 ;;
+      -R|--repo) repo="$2"; shift 2 ;;
+      --title)   title="$2"; shift 2 ;;
+      --outcome) outcome="$2"; shift 2 ;;
+      --pr)      pr="$2"; shift 2 ;;
+      --gate)    gate="$2"; shift 2 ;;
+      --tier)    tier="$2"; shift 2 ;;
+      --applied) applied="$2"; shift 2 ;;
+      --declined) declined="$2"; shift 2 ;;
+      --hoisted) hoisted="$2"; shift 2 ;;
+      --next)    next="$2"; shift 2 ;;
+      --risk)    risks+=("$2"); shift 2 ;;
+      --note)    note="$2"; shift 2 ;;
+      --quiet)   QUIET=1; shift ;;
+      *) echo "claude-work-item done: unknown flag $1" >&2; exit 2 ;;
+    esac
+  done
+  case "$outcome" in ready|blocked|merged) ;; *) echo "claude-work-item done: --outcome must be ready|blocked|merged" >&2; exit 2 ;; esac
+
+  local sf; sf="$(statefile "$PWD" "$repo" "$issue")"
+  if [ -f "$sf" ]; then
+    [ -n "$issue" ] || issue=$(jq -r '.issue // empty' "$sf")
+    [ -n "$title" ] || title=$(jq -r '.title // empty' "$sf")
+  fi
+  repo="$(repo_name "$PWD" "$repo")"
+  [ -n "$issue" ] || { echo "claude-work-item done: --issue required (no state file for $PWD)" >&2; exit 2; }
+
+  mkdir -p "$STATE_DIR"
+  local risks_json='[]'
+  [ "${#risks[@]}" -gt 0 ] && risks_json=$(printf '%s\n' "${risks[@]}" | jq -R . | jq -s .)
+  jq -cn \
+    --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg repo "$repo" --arg issue "$issue" \
+    --arg title "$title" --arg outcome "$outcome" --arg pr "$pr" --arg gate "$gate" \
+    --arg tier "$tier" --arg applied "$applied" --arg declined "$declined" \
+    --arg hoisted "$hoisted" --arg next "$next" --arg note "$note" --argjson risks "$risks_json" \
+    '{ts:$ts, repo:$repo, issue:($issue|tonumber? // $issue), title:$title, outcome:$outcome,
+      pr:$pr, gate:$gate, tier:$tier,
+      review:{applied:($applied|tonumber? // null), declined:($declined|tonumber? // null), hoisted:($hoisted|tonumber? // null)},
+      risks:$risks, next:$next, note:$note}' >> "$LOG"
+
+  [ -n "${QUIET:-}" ] && return 0
+  local line
+  line="$(spoken_line "$repo" "$issue" "$outcome" "$gate" "$applied" "$hoisted" "$next" "${#risks[@]}" "$note")"
+  # Fire and forget: the card is written; the cue must never hold up the skill.
+  if command -v speak >/dev/null 2>&1; then
+    (nohup speak chime "done" "$line" >/dev/null 2>&1 &)
+  fi
+}
+
+cmd_announce() {
+  local issue="" repo="" card line
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --issue)   issue="${2#\#}"; shift 2 ;;
+      -R|--repo) repo="$2"; shift 2 ;;
+      *) echo "claude-work-item announce: unknown flag $1" >&2; exit 2 ;;
+    esac
+  done
+  [ -n "$repo" ] && [ -n "$issue" ] || { echo "claude-work-item announce: -R and --issue required" >&2; exit 2; }
+  [ -f "$LOG" ] || { echo "claude-work-item announce: no cards yet" >&2; exit 1; }
+  # Newest card for the item; the repo matches in full or by its last segment,
+  # so owner/name and bare name both find it.
+  card=$(jq -c --arg r "$repo" --arg i "$issue" '
+    select((.issue | tostring) == $i
+           and (.repo == $r or (.repo | split("/") | last) == ($r | split("/") | last)))' "$LOG" | tail -n 1)
+  [ -n "$card" ] || { echo "claude-work-item announce: no card for $repo#$issue" >&2; exit 1; }
+  line="$(spoken_line \
+    "$(jq -r '.repo' <<<"$card")" "$(jq -r '.issue' <<<"$card")" "$(jq -r '.outcome' <<<"$card")" \
+    "$(jq -r '.gate // ""' <<<"$card")" "$(jq -r '.review.applied // "" | tostring' <<<"$card")" \
+    "$(jq -r '.review.hoisted // "" | tostring' <<<"$card")" "$(jq -r '.next // ""' <<<"$card")" \
+    "$(jq -r '.risks | length' <<<"$card")" "$(jq -r '.note // ""' <<<"$card")")"
+  printf '%s\n' "$line"
+  if command -v speak >/dev/null 2>&1; then
+    (nohup speak chime "done" "$line" >/dev/null 2>&1 &)
+  fi
+}
+
+cmd_recent() {
+  local n="${1:-5}"
+  [ -f "$LOG" ] || { echo "no completed work items yet"; return 0; }
+  tail -n "$n" "$LOG" | jq -r '
+    def num: if . == null then "—" else tostring end;
+    "\(.ts | sub("T";" ") | sub("Z$";"")) · \(.repo)#\(.issue) · \(.outcome | ascii_upcase)\(if .tier != "" then " · risk:" + .tier else "" end)\(if .gate != "" then " · gate " + .gate else "" end)",
+    "  \(.title)",
+    (if .pr != "" then "  \(.pr)" else empty end),
+    "  review: \(.review.applied|num) applied · \(.review.declined|num) declined · \(.review.hoisted|num) hoisted",
+    (if (.risks|length) > 0 then (.risks[] | "  risk: \(.)") else empty end),
+    (if .next != "" then "  next: \(.next)" else empty end),
+    (if .note != "" then "  note: \(.note)" else empty end),
+    ""'
+}
+
+cmd="${1:-}"
+case "$cmd" in
+  set)
+    # set [-R|--repo NAME] <issue> <phase: looking|working|in-review> <title...>
+    shift
+    repo=""
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        -R|--repo) repo="$2"; shift 2 ;;
+        *) break ;;
+      esac
+    done
+    issue="${1#\#}"; phase="$2"; shift 2; title="$*"
+    mkdir -p "$STATE_DIR"
+    jq -n --argjson issue "$issue" --arg phase "$phase" --arg title "$title" \
+      '{issue:$issue, phase:$phase, title:$title}' > "$(statefile "$PWD" "$repo" "$issue")"
+    ;;
+  clear)
+    # clear [-R|--repo NAME] [--issue N]
+    shift
+    repo="" issue=""
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        -R|--repo) repo="$2"; shift 2 ;;
+        --issue)   issue="${2#\#}"; shift 2 ;;
+        *) echo "claude-work-item clear: unknown flag $1" >&2; exit 2 ;;
+      esac
+    done
+    rm -f "$(statefile "$PWD" "$repo" "$issue")"
+    ;;
+  clear-hook)
+    # stdin is the SessionStart hook JSON; clear the work item for its cwd.
+    cwd=$(jq -r '.cwd // empty')
+    [ -n "$cwd" ] && rm -f "$(statefile "$cwd")"
+    ;;
+  done)
+    shift; cmd_done "$@"
+    ;;
+  announce)
+    shift; cmd_announce "$@"
+    ;;
+  recent)
+    shift; cmd_recent "$@"
+    ;;
+  *)
+    echo "usage: claude-work-item {set [-R repo] <issue> <phase> <title>|clear [-R repo] [--issue N]|clear-hook|done [-R repo] --issue N --outcome ready|blocked|merged [...] [--quiet]|announce -R repo --issue N|recent [N]}" >&2
+    exit 2
+    ;;
+esac

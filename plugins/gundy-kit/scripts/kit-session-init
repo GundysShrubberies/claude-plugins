@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# kit-session-init — SessionStart hook: records this plugin's installed root
+# to a well-known file so slash commands can find scripts/ at runtime.
+#
+# WHY this exists: Claude Code substitutes ${CLAUDE_PLUGIN_ROOT} inside hook
+# commands, MCP/LSP server config, and skill/agent content — but NOT inside a
+# command's Markdown body (verified against code.claude.com/docs/en/plugins-reference.md,
+# "Environment variables": the placeholder list is hook and monitor commands,
+# skill and agent content, and MCP/LSP server config; command Markdown is not
+# on it). A plugin's scripts/ directory is also not auto-added to PATH — only
+# a top-level bin/ gets that treatment, and this plugin intentionally does not
+# use one. So a command like /handoff or /pickup, which needs to run a script
+# in scripts/, has no built-in way to know where the plugin lives.
+#
+# This hook runs on every SessionStart (see hooks/hooks.json) while
+# CLAUDE_PLUGIN_ROOT *is* set (it is a hook command), and writes it to a fixed
+# path. A command's Markdown body then tells Claude to read that file to
+# resolve "<root>/scripts/<name>". Best effort: if this hook has not run yet
+# (e.g. the plugin was just installed mid-session), the file will be missing
+# or stale; the commands that depend on it say what to do about that.
+set -euo pipefail
+OUT="$HOME/.claude/gundy-kit/plugin-root"
+mkdir -p "$(dirname "$OUT")"
+printf '%s\n' "${CLAUDE_PLUGIN_ROOT:-}" > "$OUT"

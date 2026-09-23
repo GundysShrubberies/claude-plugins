@@ -1,0 +1,240 @@
+#!/usr/bin/env bash
+# kit-handoff — read and write cross-machine agent handoffs in the
+# GundysShrubberies/josh-tyler-handoffs repo through the GitHub Contents API.
+#
+# WHY this exists
+# ----------------
+# An agent on one machine (or a cloud routine) stops mid-task; an agent on
+# another machine picks the work up. The store has to be reachable from every
+# machine and from the cloud, so it is a plain GitHub repo. Every file
+# operation is a single Contents-API call: no clone, no merge conflicts, and
+# the per-file SHA doubles as a claim token — two agents cannot both pick up
+# the same handoff, because the second delete fails on the stale SHA.
+#
+# The standard (also in the repo's README):
+#   * `write` creates or updates handoffs/<slug>.md (frontmatter is added here).
+#   * `pickup` prints the body AND archives it in the same step — archiving IS
+#     the claim, and it happens before the picker does any work.
+#   * `read` prints without claiming. Look first, pick up once it is yours.
+#   * Unfinished after pickup? `write` the same slug again to hand it back.
+#
+# Usage:
+#   kit-handoff list
+#   kit-handoff write <slug> [--title T] [--repo owner/repo] [--branch B] [--from HOST]   # body on stdin
+#   kit-handoff read <slug>
+#   kit-handoff pickup <slug>
+#   kit-handoff archive <slug>
+#   kit-handoff template
+#
+#   <slug>  kebab-case; prefix repo-specific work with the repo: billing-api--retry-backoff
+#   KIT_HANDOFF_REPO overrides the store (default GundysShrubberies/josh-tyler-handoffs).
+#
+# Exit codes: 0 ok · 1 handoff not found · 3 claim conflict (someone else picked it
+# up first) · 4 GitHub API failure · 64 usage.
+set -euo pipefail
+
+usage() { sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+die() { echo "kit-handoff: $1" >&2; exit "${2:-4}"; }
+
+STORE="${KIT_HANDOFF_REPO:-GundysShrubberies/josh-tyler-handoffs}"
+INBOX="handoffs"
+ARCHIVE="archive"
+
+now_utc() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+b64enc() { base64 | tr -d '\n'; }
+b64dec() { tr -d '\n' | base64 -d; }
+
+# api <method> <path> [json-on-stdin]: runs gh api, capturing the HTTP status
+# class from gh's error line so callers can tell 404/409 from real failures.
+# Prints the response body; returns 0 ok, 1 not found, 3 conflict, 4 other.
+api() {
+  local method=$1 path=$2 input=${3:-} out err rc errf
+  errf=$(mktemp)
+  if [ -n "$input" ]; then
+    out=$(printf '%s' "$input" | gh api -X "$method" "repos/$STORE/contents/$path" --input - 2>"$errf") && rc=0 || rc=$?
+  else
+    out=$(gh api -X "$method" "repos/$STORE/contents/$path" 2>"$errf") && rc=0 || rc=$?
+  fi
+  err=$(cat "$errf"); rm -f "$errf"
+  if [ "$rc" -ne 0 ]; then
+    case "$err" in
+      *"HTTP 404"*) return 1 ;;
+      *"HTTP 409"*|*"HTTP 422"*) return 3 ;;
+      *) echo "kit-handoff: gh api $method $path failed: $err" >&2; return 4 ;;
+    esac
+  fi
+  printf '%s' "$out"
+}
+
+# get_file <path>: sets FILE_SHA and FILE_BODY. Returns 1 when absent.
+get_file() {
+  local json rc
+  json=$(api GET "$1") && rc=0 || rc=$?
+  [ "$rc" -eq 0 ] || return "$rc"
+  FILE_SHA=$(jq -r '.sha' <<<"$json")
+  FILE_BODY=$(jq -r '.content' <<<"$json" | b64dec)
+}
+
+put_file() { # <path> <message> <content> [sha]
+  local payload
+  payload=$(jq -n --arg m "$2" --arg c "$(printf '%s\n' "$3" | b64enc)" --arg s "${4:-}" \
+    '{message:$m, content:$c} + (if $s != "" then {sha:$s} else {} end)')
+  api PUT "$1" "$payload" >/dev/null
+}
+
+delete_file() { # <path> <message> <sha>
+  local payload
+  payload=$(jq -n --arg m "$2" --arg s "$3" '{message:$m, sha:$s}')
+  api DELETE "$1" "$payload" >/dev/null
+}
+
+# Frontmatter helpers. A handoff is "---\nkey: value\n...\n---\n<body>".
+fm_get() { # <doc> <key>
+  awk -v k="$2" 'NR==1&&$0!="---"{exit} NR>1&&$0=="---"{exit} NR>1{i=index($0,": "); if(i&&substr($0,1,i-1)==k){print substr($0,i+2); exit}}' <<<"$1"
+}
+strip_fm() { # <doc> -> body without frontmatter
+  awk 'NR==1&&$0=="---"{f=1;next} f&&$0=="---"{f=0;s=1;next} f{next} {print}' <<<"$1"
+}
+fm_block() { # key value key value ... -> "---\n...\n---"
+  echo '---'
+  while [ $# -gt 1 ]; do
+    [ -n "$2" ] && printf '%s: %s\n' "$1" "$2"
+    shift 2
+  done
+  echo '---'
+}
+
+valid_slug() { [[ "$1" =~ ^[a-z0-9]+([-.]+[a-z0-9]+)*$ ]]; }
+
+# The Contents API directory listing is eventually consistent: for a few
+# seconds after a write the new file can be missing from `list` while `read`
+# already returns it. Re-run `list`; never conclude "nothing open" from one
+# call made right after a write.
+cmd_list() {
+  local dir rc names n doc
+  dir=$(api GET "$INBOX") && rc=0 || rc=$?
+  if [ "$rc" -eq 1 ]; then echo "kit-handoff: no open handoffs"; return 0; fi
+  [ "$rc" -eq 0 ] || return "$rc"
+  names=$(jq -r '.[] | select(.type=="file" and (.name|endswith(".md"))) | .name' <<<"$dir")
+  if [ -z "$names" ]; then echo "kit-handoff: no open handoffs"; return 0; fi
+  printf '%-36s %-12s %-20s %s\n' SLUG FROM UPDATED TITLE
+  while IFS= read -r n; do
+    get_file "$INBOX/$n" || { echo "kit-handoff: could not read $INBOX/$n (row omitted)" >&2; continue; }
+    doc=$FILE_BODY
+    printf '%-36s %-12s %-20s %s\n' "${n%.md}" "$(fm_get "$doc" from)" "$(fm_get "$doc" updated)" "$(fm_get "$doc" title)"
+  done <<<"$names"
+}
+
+cmd_write() {
+  local slug=$1; shift
+  local title="" repo="" branch="" from="" body created="" rc sha=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --title|--repo|--branch|--from) [ $# -ge 2 ] || die "$1 needs a value" 64 ;;
+    esac
+    case "$1" in
+      --title) title=$2; shift 2 ;;
+      --repo) repo=$2; shift 2 ;;
+      --branch) branch=$2; shift 2 ;;
+      --from) from=$2; shift 2 ;;
+      *) die "unknown option '$1'" 64 ;;
+    esac
+  done
+  [ -t 0 ] && die "write expects the handoff body on stdin" 64
+  body=$(strip_fm "$(cat)")
+  [ -n "$(tr -d '[:space:]' <<<"$body")" ] || die "empty body" 64
+
+  [ -n "$from" ] || from=$(hostname -s 2>/dev/null || hostname)
+  if [ -z "$repo" ] && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    repo=$(git config --get remote.origin.url 2>/dev/null | sed -E 's#.*[/:]([^/]+/[^/]+?)(\.git)?/?$#\1#' || true)
+    [ -n "$branch" ] || branch=$(git branch --show-current 2>/dev/null || true)
+  fi
+  if [ -z "$title" ]; then
+    title=$(grep -m1 -E '^# ' <<<"$body" | sed 's/^# //' || true)
+    [ -n "$title" ] || title=$(grep -m1 -vE '^\s*$|^#' <<<"$body" | cut -c1-80 || true)
+    [ -n "$title" ] || title=$slug
+  fi
+
+  get_file "$INBOX/$slug.md" && rc=0 || rc=$?
+  case "$rc" in
+    0) sha=$FILE_SHA; created=$(fm_get "$FILE_BODY" created) ;;
+    1) ;;
+    *) return "$rc" ;;
+  esac
+  [ -n "$created" ] || created=$(now_utc)
+
+  local doc verb=written
+  [ -z "$sha" ] || verb=updated
+  doc=$(fm_block title "$title" from "$from" repo "$repo" branch "$branch" created "$created" updated "$(now_utc)")$'\n'$'\n'"$body"
+  put_file "$INBOX/$slug.md" "handoff($slug): $verb from $from" "$doc" "$sha" && rc=0 || rc=$?
+  case "$rc" in
+    0) ;;
+    3) die "'$slug' changed in the store while writing (another machine updated it) — re-run to retry on the new version" 3 ;;
+    *) die "'$slug' was not written (API failure); body not stored" "$rc" ;;
+  esac
+  echo "HANDOFF: $slug $verb (from $from)"
+}
+
+cmd_read() {
+  get_file "$INBOX/$1.md" || { [ $? -eq 1 ] && die "no open handoff '$1'" 1; return 4; }
+  printf '%s\n' "$FILE_BODY"
+}
+
+# Claim = delete from the inbox with the SHA we read. Only after that succeeds
+# is the body printed and the archive copy written, so a caller acting on the
+# output is always the sole owner.
+claim() { # <slug> <print:0|1>
+  local slug=$1 print=$2 me stamp dest doc rc
+  get_file "$INBOX/$slug.md" || { [ $? -eq 1 ] && die "no open handoff '$slug'" 1; return 4; }
+  me=$(hostname -s 2>/dev/null || hostname)
+  stamp=$(now_utc)
+  delete_file "$INBOX/$slug.md" "handoff($slug): picked up by $me" "$FILE_SHA" && rc=0 || rc=$?
+  case "$rc" in
+    0) ;;
+    3) die "'$slug' was picked up by someone else first — run 'kit-handoff list'" 3 ;;
+    *) return "$rc" ;;
+  esac
+  [ "$print" -eq 1 ] && printf '%s\n' "$FILE_BODY"
+  # Claim fields go into the existing frontmatter; a hand-written handoff
+  # without one gets a fresh block prepended rather than a stray `---` hit.
+  if [ "$(head -n1 <<<"$FILE_BODY")" = "---" ]; then
+    doc=$(awk -v by="$me" -v at="$stamp" 'NR>1&&$0=="---"&&!d{print "picked_up_by: " by; print "picked_up_at: " at; d=1} {print}' <<<"$FILE_BODY")
+  else
+    doc=$(fm_block picked_up_by "$me" picked_up_at "$stamp")$'\n'$'\n'"$FILE_BODY"
+  fi
+  dest="$ARCHIVE/${stamp:0:4}/${stamp:5:2}/$slug--${stamp//[:]/-}.md"
+  if ! put_file "$dest" "handoff($slug): archive after pickup by $me" "$doc"; then
+    # Undo the claim so the handoff is not stranded in git history only.
+    if put_file "$INBOX/$slug.md" "handoff($slug): restored — archive write failed" "$FILE_BODY"; then
+      echo "kit-handoff: archiving '$slug' to $dest failed; restored it to the inbox (claim undone)" >&2
+    else
+      echo "kit-handoff: archiving '$slug' failed AND restore failed; recover it from the store's git history" >&2
+    fi
+    return 4
+  fi
+  echo "HANDOFF: $slug picked up by $me -> $dest" >&2
+}
+
+cmd_template() {
+  get_file "HANDOFF_TEMPLATE.md" || die "HANDOFF_TEMPLATE.md missing from $STORE" 4
+  printf '%s\n' "$FILE_BODY"
+}
+
+[ $# -ge 1 ] || usage 64
+case "$1" in
+  -h|--help) usage ;;
+  list) cmd_list ;;
+  template) cmd_template ;;
+  write|read|pickup|archive)
+    cmd=$1; slug=${2:-}
+    [ -n "$slug" ] || die "$cmd needs a <slug>" 64
+    valid_slug "$slug" || die "slug '$slug' must be kebab-case (a-z, 0-9, '-', '.')" 64
+    shift 2
+    case "$cmd" in
+      write) cmd_write "$slug" "$@" ;;
+      read) cmd_read "$slug" ;;
+      pickup) claim "$slug" 1 ;;
+      archive) claim "$slug" 0 ;;
+    esac ;;
+  *) die "unknown command '$1'" 64 ;;
+esac

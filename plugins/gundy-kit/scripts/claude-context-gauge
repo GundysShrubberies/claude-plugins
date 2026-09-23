@@ -1,0 +1,148 @@
+#!/usr/bin/env bash
+# claude-context-gauge — shared helper: given a session transcript (JSONL, one
+# message per line, the format Claude Code writes under
+# ~/.claude/projects/<project>/<session>.jsonl), print how full the live
+# context window is.
+#
+# "Live context" is the prompt size of the LATEST turn, not a running total:
+# find the last assistant message that carries a `usage` object and sum
+# input_tokens + cache_creation_input_tokens + cache_read_input_tokens. That
+# is exactly the formula the statusline's `context_window.used_percentage`
+# field documents (code.claude.com/docs/en/statusline.md, "Context window
+# fields": "The used_percentage field is calculated from input tokens only").
+# Output tokens are excluded on purpose — they are not still "in" the window
+# on the next turn's request.
+#
+# Window size, in priority order:
+#   1. CLAUDE_CONTEXT_WINDOW — an explicit override, wins over everything.
+#   2. The size claude-statusline recorded from the AUTHORITATIVE
+#      `context_window.context_window_size` field it receives on stdin,
+#      keyed by session id under $TMPDIR/claude-tool-guard/<session_id>.window
+#      (only looked up for a main-session transcript, never a subagent's —
+#      see below). A PreToolUse hook's own input never carries a
+#      context_window field at all, so this recorded file is the only way a
+#      hook-time caller (claude-tool-guard) can know a session's REAL window
+#      size rather than guess it from the model id.
+#   3. A model-id table, for whichever session has not (yet) had a statusline
+#      render (a very fresh session) or is a subagent (no statusline of its
+#      own): an id containing `[1m]` or `-1m` anywhere, or exactly
+#      `claude-fable-5-1`/`claude-mythos-5-1` (orchestrator models that run a
+#      1,000,000-token window without an `[1m]`-style id suffix — dotfiles#113
+#      follow-up, found live: the table's old default-200k guess put this
+#      session's real ~18% usage at a false 88%, firing the main-session
+#      RESET message backwards), means 1,000,000; anything else means the
+#      default 200,000 (code.claude.com/docs/en/statusline.md,
+#      `context_window.context_window_size`: "200000 by default, or 1000000
+#      for models with extended context").
+#
+# Speed: this runs on every PreToolUse call (via claude-tool-guard) and on
+# every statusline render, so it must not scan a multi-MB transcript top to
+# bottom on the common path. It reads a generous tail chunk first (bytes, not
+# lines — `tail -c`) and only falls back to a full-file scan if that chunk
+# has no usage-bearing assistant message (e.g. right after the file rotated,
+# or a very early call before much has been written).
+#
+# Usage: claude-context-gauge <transcript-path>
+# Output (stdout, one line, on success): "<pct> <used_tokens> <window_size>"
+#   pct is an integer 0-100+ (can exceed 100 — Claude Code lets a turn run
+#   over before compacting). Callers that only need the percentage should
+#   read the first field.
+# Exit codes:
+#   0  a real usage line was found, line printed
+#   3  transcript missing, unreadable, or has no REAL usage yet (no
+#      assistant/usage record at all, or every one found is a zero-usage
+#      placeholder like the `<synthetic>` record) — callers MUST treat this
+#      as "unknown", never as 0 (a fresh session with 0% usage looks
+#      identical to "we don't know" otherwise, and the two must not be
+#      confused by a caller deciding whether to warn).
+#   2  usage error (bad arguments)
+set -euo pipefail
+
+TAIL_BYTES="${CLAUDE_CONTEXT_GAUGE_TAIL_BYTES:-200000}"
+
+usage() {
+  echo "usage: claude-context-gauge <transcript-path>" >&2
+  exit 2
+}
+
+command -v jq >/dev/null 2>&1 || exit 3
+
+transcript="${1:-}"
+[ -n "$transcript" ] || usage
+[ -r "$transcript" ] || exit 3
+
+# last_usage_line <content>: emit the LAST line in <content> that is an
+# assistant message carrying a REAL usage object, or nothing.
+# Two things disqualify a record even though it has a `usage` object:
+#   - model == "<synthetic>" — Claude Code appends a synthetic placeholder
+#     assistant record (e.g. after a subagent's final turn) with a model id
+#     of literally "<synthetic>" and every usage field zeroed.
+#   - the prompt-side sum (input + cache_creation + cache_read) is 0 — belt
+#     and suspenders for any other zero-usage placeholder, synthetic or not.
+# Without this filter, a synthetic record landing last in the file reports a
+# false 0% instead of the real last turn's usage (dotfiles#113 review fix:
+# reproduced on a real subagent transcript that ended in exactly this record).
+# jq parses a stream of concatenated JSON values without needing -R/--slurp,
+# so feeding it raw JSONL (one value per line) works directly; a truncated
+# leading fragment (from `tail -c`) just fails to parse and is skipped —
+# every fully-formed value after it is still emitted.
+last_usage_line() {
+  jq -c '
+    select(.type == "assistant"
+      and (.message.usage.input_tokens != null)
+      and (.message.model != "<synthetic>")
+      and (((.message.usage.input_tokens // 0)
+            + (.message.usage.cache_creation_input_tokens // 0)
+            + (.message.usage.cache_read_input_tokens // 0)) > 0))
+  ' 2>/dev/null | tail -n 1
+}
+
+line=""
+if [ "$TAIL_BYTES" -gt 0 ] 2>/dev/null; then
+  # Drop the first (possibly byte-truncated, mid-line) record of the tail
+  # chunk — every record after it is guaranteed complete.
+  chunk=$(tail -c "$TAIL_BYTES" "$transcript" 2>/dev/null | tail -n +2 || true)
+  [ -n "$chunk" ] && line=$(printf '%s' "$chunk" | last_usage_line)
+fi
+
+if [ -z "$line" ]; then
+  # Fallback: the tail chunk had nothing usable (small/rotated transcript, or
+  # no assistant turn yet) — scan the whole file once.
+  line=$(last_usage_line < "$transcript")
+fi
+
+[ -n "$line" ] || exit 3
+
+used=$(jq -r '.message.usage | (.input_tokens + .cache_creation_input_tokens + .cache_read_input_tokens)' <<<"$line" 2>/dev/null || true)
+[ -n "$used" ] && [ "$used" != "null" ] || exit 3
+
+window="${CLAUDE_CONTEXT_WINDOW:-}"
+
+# Recorded size from claude-statusline, keyed by session id. Only a
+# main-session transcript's filename doubles as its session id; a subagent's
+# file (.../subagents/agent-<id>.jsonl) never gets a statusline render of its
+# own, so skip the lookup there rather than read a meaningless key.
+if [ -z "$window" ]; then
+  case "$transcript" in
+    */subagents/*) ;;
+    *)
+      recorded_file="${TMPDIR:-/tmp}/claude-tool-guard/$(basename "$transcript" .jsonl).window"
+      if [ -r "$recorded_file" ]; then
+        recorded=$(cat "$recorded_file" 2>/dev/null || true)
+        case "$recorded" in ''|*[!0-9]*) recorded="" ;; esac
+        [ -n "$recorded" ] && window="$recorded"
+      fi
+      ;;
+  esac
+fi
+
+if [ -z "$window" ]; then
+  model=$(jq -r '.message.model // empty' <<<"$line" 2>/dev/null || true)
+  window=200000
+  case "$model" in
+    *'[1m]'*|*-1m*|claude-fable-5-1|claude-mythos-5-1) window=1000000 ;;
+  esac
+fi
+
+pct=$(( used * 100 / window ))
+printf '%s %s %s\n' "$pct" "$used" "$window"

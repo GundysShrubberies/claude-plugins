@@ -4,7 +4,7 @@ argument-hint: "[slug] [--title T]"
 ---
 
 Summarise where this session's work stands and write it to the shared handoff
-store (`GundysShrubberies/josh-tyler-handoffs` by default — override with the
+store (`ConnorGunderson/josh-tyler-handoffs` by default — override with the
 `KIT_HANDOFF_REPO` env var) with `kit-handoff write`. The reader will be a
 fresh agent on a different machine with none of this session's context; the
 bar is that they can continue in five minutes without asking anything.

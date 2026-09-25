@@ -19,7 +19,7 @@
 #                          work the previous one already finished or ruled out
 #
 # Store push: every `write` ALSO pushes the same body to the cross-machine
-# store (default GundysShrubberies/josh-tyler-handoffs, override
+# store (default ConnorGunderson/josh-tyler-handoffs, override
 # KIT_HANDOFF_REPO), through this plugin's kit-handoff script, as the slug
 # "<hostname>--session" (override: --slug or CLAUDE_HANDOFF_SLUG), so an
 # agent on any other machine can `kit-handoff pickup` it — that is the
@@ -164,7 +164,7 @@ cmd_inbox() {
   out=$(with_timeout "$client" list 2>/dev/null) || return 0
   grep -q '^SLUG' <<<"$out" || return 0
   # shellcheck disable=SC2016  # backticks are literal Markdown for the model
-  printf 'Cross-machine hand-off inbox (GundysShrubberies/josh-tyler-handoffs, or KIT_HANDOFF_REPO if set) has open hand-offs. If one is the work this session is for, claim it FIRST with `kit-handoff pickup <slug>` (or /pickup) — pickup archives it so no other machine takes it — then continue from its Next steps. Otherwise leave it.\n%s\n' "$out"
+  printf 'Cross-machine hand-off inbox (ConnorGunderson/josh-tyler-handoffs, or KIT_HANDOFF_REPO if set) has open hand-offs. If one is the work this session is for, claim it FIRST with `kit-handoff pickup <slug>` (or /pickup) — pickup archives it so no other machine takes it — then continue from its Next steps. Otherwise leave it.\n%s\n' "$out"
 }
 
 cmd_read() {

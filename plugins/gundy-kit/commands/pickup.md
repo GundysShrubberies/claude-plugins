@@ -4,7 +4,7 @@ argument-hint: "[slug]"
 ---
 
 Continue work another agent handed off through the shared store
-(`GundysShrubberies/josh-tyler-handoffs` by default — override with
+(`ConnorGunderson/josh-tyler-handoffs` by default — override with
 `KIT_HANDOFF_REPO`). **Picking up claims it:** the handoff is archived in the
 same command that prints it, before any work starts, so no one else can also
 pick it up. Look with `read`; claim with `pickup`.

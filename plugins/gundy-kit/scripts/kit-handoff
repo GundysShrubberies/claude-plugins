@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # kit-handoff — read and write cross-machine agent handoffs in the
-# GundysShrubberies/josh-tyler-handoffs repo through the GitHub Contents API.
+# ConnorGunderson/josh-tyler-handoffs repo through the GitHub Contents API.
 #
 # WHY this exists
 # ----------------
@@ -27,7 +27,7 @@
 #   kit-handoff template
 #
 #   <slug>  kebab-case; prefix repo-specific work with the repo: billing-api--retry-backoff
-#   KIT_HANDOFF_REPO overrides the store (default GundysShrubberies/josh-tyler-handoffs).
+#   KIT_HANDOFF_REPO overrides the store (default ConnorGunderson/josh-tyler-handoffs).
 #
 # Exit codes: 0 ok · 1 handoff not found · 3 claim conflict (someone else picked it
 # up first) · 4 GitHub API failure · 64 usage.
@@ -36,7 +36,7 @@ set -euo pipefail
 usage() { sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 die() { echo "kit-handoff: $1" >&2; exit "${2:-4}"; }
 
-STORE="${KIT_HANDOFF_REPO:-GundysShrubberies/josh-tyler-handoffs}"
+STORE="${KIT_HANDOFF_REPO:-ConnorGunderson/josh-tyler-handoffs}"
 INBOX="handoffs"
 ARCHIVE="archive"
 

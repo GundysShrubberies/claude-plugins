@@ -30,7 +30,7 @@ to let the SessionStart hook fire, or find them directly:
    not there, offer (Recommended, since it's the one they'll be working in):
    "I don't see the project on this machine yet — want me to download a copy
    to ~/josh-tyler-workspace?" On yes: `git clone
-   https://github.com/GundysShrubberies/josh-tyler-workspace
+   https://github.com/ConnorGunderson/josh-tyler-workspace
    ~/josh-tyler-workspace`. From here on, work inside that directory.
 
 4. **Check `.kit/config.json` exists** in the repo. If missing:

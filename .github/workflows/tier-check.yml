@@ -1,0 +1,43 @@
+# Thin caller — review-tier floor gate (arbor#72, part of arbor#146).
+# All logic lives in the reusable workflow:
+#   GundysShrubberies/claude-workflows/.github/workflows/tier-check.yml@v1
+# Reads .arbor/review-tiers.json (default path) for the path→tier map.
+#
+# Runner dependency: the job below targets the fleet's self-hosted runner pool
+# (ARBOR_RUNNER_LABEL, X64 fallback), and the reusable workflow shells out to
+# `gh` there — confirm `gh` resolves on the self-hosted runner before
+# declaring adoption complete in a newly-adopted repo (arbor#183 tracks this
+# gap fleet-wide; it is not something this caller or /adopt-gates can verify
+# from a laptop).
+name: Tier check
+
+# Body/title edits re-queue this gate (see the `edited` type below); with no
+# group each queued run would execute in full instead of a newer one
+# superseding an older, still-queued one — mirrors pr-review.yml's group.
+concurrency:
+  group: tier-check-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+on:
+  pull_request:
+    branches: [master]
+    types: [opened, synchronize, reopened, edited]
+    # Explicit types (arbor-thresholds#19, part of arbor#372): default GitHub
+    # types are opened/synchronize/reopened — add `edited` so a Risk-tier
+    # bump on an existing PR (e.g. ship -> show/ask) re-runs the tier floor
+    # gate instead of needing a manual rerun. This caller has no Risk-tier
+    # guard, so ANY body/title edit — typo fixes included — re-queues this
+    # job; the concurrency group above is what keeps an edit burst from
+    # queuing duplicate runs.
+
+jobs:
+  tier-check:
+    # The repo default GITHUB_TOKEN is read-only; a reusable workflow is capped
+    # by its caller — so grant the scopes the reusable needs here, or the token
+    # it receives can't read PR metadata (contents: read, pull-requests: read).
+    permissions:
+      contents: read
+      pull-requests: read
+    uses: GundysShrubberies/claude-workflows/.github/workflows/tier-check.yml@v1
+    with:
+      runner-label: ${{ vars.ARBOR_RUNNER_LABEL || '["self-hosted","X64"]' }}

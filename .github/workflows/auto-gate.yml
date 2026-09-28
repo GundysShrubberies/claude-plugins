@@ -1,0 +1,51 @@
+# Auto gate — thin caller for the shared issue-open board-sync reusable workflow.
+#
+# amended 2026-08-27 (Gate 1 removed), amended again 2026-09-03 (needs-human-approval
+# retired fleet-wide): on every newly-opened issue (web UI, gh issue create,
+# /raise-issue, API), this ensures the issue is on the shared board with Status
+# Approved, so any issue that lands outside /raise-issue's own board-add still ends
+# up dispatchable (see root CLAUDE.md → GitHub Issue Workflow). Board Status is now
+# the ONLY gate; a human who wants to hold an issue moves its card to Backlog by hand.
+# All logic lives in ONE place: the reusable workflow at
+#   GundysShrubberies/claude-workflows/.github/workflows/auto-gate-on-issue-open.yml
+# (claude-workflows PR #218). This file just invokes it on the issues:opened event.
+# To change the board-add behavior, edit the reusable workflow, not this caller.
+#
+# Pinned @v1 (not @main) per the pinning policy in GundysShrubberies/claude-workflows#16 — updates
+# ship on a deliberate tag move, not instantly on every commit to main.
+#
+# No repo secret required for the runner routing below, but the caller must grant
+# the built-in GITHUB_TOKEN `issues: write` (see permissions: below): a reusable
+# workflow can only narrow the token it is handed, never widen it, so without this
+# a repo whose default token is read-only would 403 and silently fail to gate.
+#
+# Required repo secret: PROJECT_PAT — a fine-grained PAT with Account → Projects:
+# Read and write + Repository → Issues: Read. The board write is this workflow's
+# ONLY job post-#218, and the built-in GITHUB_TOKEN cannot write a Projects v2
+# board. When the secret is absent
+# the reusable skips the board step with a notice and exits green (it then does
+# nothing at all). The reusable still accepts the pre-#218 `label`/`skip-labels`
+# inputs for compatibility but ignores them — this caller passes none.
+name: Auto gate
+
+on:
+  issues:
+    types: [opened]
+
+jobs:
+  gate:
+    permissions:
+      issues: write
+    uses: GundysShrubberies/claude-workflows/.github/workflows/auto-gate-on-issue-open.yml@v1
+    # Routed through the org ARBOR_RUNNER_LABEL variable (self-hosted by
+    # default; hosted Actions minutes are exhausted fleet-wide) — supersedes
+    # the earlier arbor#299/PR#352 hosted-default carve-out. An unset
+    # variable falls back to the desktop X64 runner, never the Pi
+    # (issue #70 / umbrella arbor#395).
+    with:
+      runner-label: ${{ vars.ARBOR_RUNNER_LABEL || '["self-hosted","X64"]' }}
+    # Board writes need a PAT — the built-in GITHUB_TOKEN cannot touch Projects v2.
+    # Without this block the reusable workflow skips the board add with a notice
+    # and exits green (which is what silently happened fleet-wide until 2026-09-02).
+    secrets:
+      project_pat: ${{ secrets.PROJECT_PAT }}

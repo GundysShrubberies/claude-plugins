@@ -20,7 +20,7 @@ concurrency:
 
 on:
   pull_request:
-    branches: [master]
+    branches: [main]
     types: [opened, synchronize, reopened, edited]
     # Explicit types (arbor-thresholds#19, part of arbor#372): default GitHub
     # types are opened/synchronize/reopened — add `edited` so a Risk-tier

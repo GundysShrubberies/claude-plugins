@@ -37,13 +37,9 @@ jobs:
     permissions:
       issues: write
     uses: GundysShrubberies/claude-workflows/.github/workflows/auto-gate-on-issue-open.yml@v1
-    # Routed through the org ARBOR_RUNNER_LABEL variable (self-hosted by
-    # default; hosted Actions minutes are exhausted fleet-wide) — supersedes
-    # the earlier arbor#299/PR#352 hosted-default carve-out. An unset
-    # variable falls back to the desktop X64 runner, never the Pi
-    # (issue #70 / umbrella arbor#395).
+    # Public repo → GitHub-hosted runner, never self-hosted (operator decision 2026-09-28).
     with:
-      runner-label: ${{ vars.ARBOR_RUNNER_LABEL || '["self-hosted","X64"]' }}
+      runner-label: '"ubuntu-latest"'
     # Board writes need a PAT — the built-in GITHUB_TOKEN cannot touch Projects v2.
     # Without this block the reusable workflow skips the board add with a notice
     # and exits green (which is what silently happened fleet-wide until 2026-09-02).

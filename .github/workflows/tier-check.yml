@@ -39,5 +39,6 @@ jobs:
       contents: read
       pull-requests: read
     uses: GundysShrubberies/claude-workflows/.github/workflows/tier-check.yml@v1
+    # Public repo → GitHub-hosted runner, never self-hosted (operator decision 2026-09-28).
     with:
-      runner-label: ${{ vars.ARBOR_RUNNER_LABEL || '["self-hosted","X64"]' }}
+      runner-label: '"ubuntu-latest"'

@@ -2,6 +2,9 @@
 
 A private Claude Code plugin marketplace.
 
+Copyright (c) 2026 Connor Gunderson. All rights reserved. See [`LICENSE`](LICENSE).
+Consumer audit for the move to private: [`docs/visibility-audit.md`](docs/visibility-audit.md).
+
 ## Install
 
 ```

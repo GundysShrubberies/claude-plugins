@@ -26,7 +26,8 @@
 #   3. A model-id table, for whichever session has not (yet) had a statusline
 #      render (a very fresh session) or is a subagent (no statusline of its
 #      own): an id containing `[1m]` or `-1m` anywhere, or exactly
-#      `claude-fable-5-1`/`claude-mythos-5-1` (orchestrator models that run a
+#      `claude-fable-5-2`/`claude-mythos-5-2` (or the older `-5-1` ids;
+#      orchestrator models that run a
 #      1,000,000-token window without an `[1m]`-style id suffix — dotfiles#113
 #      follow-up, found live: the table's old default-200k guess put this
 #      session's real ~18% usage at a false 88%, firing the main-session
@@ -140,7 +141,9 @@ if [ -z "$window" ]; then
   model=$(jq -r '.message.model // empty' <<<"$line" 2>/dev/null || true)
   window=200000
   case "$model" in
-    *'[1m]'*|*-1m*|claude-fable-5-1|claude-mythos-5-1) window=1000000 ;;
+    *'[1m]'*|*-1m*|claude-fable-5-2|claude-mythos-5-2) window=1000000 ;;
+    # 5-1 kept while sessions pinned to it still run (both ids stay active).
+    claude-fable-5-1|claude-mythos-5-1) window=1000000 ;;
   esac
 fi
 

@@ -1,0 +1,29 @@
+# Auto gate — thin caller for the shared issue-open board-sync reusable workflow.
+#
+# On every newly-opened issue this ensures the issue is on the shared board with
+# Status Approved, so any issue filed outside /raise-issue still ends up
+# dispatchable. All logic lives in the reusable workflow at
+#   GundysShrubberies/claude-workflows/.github/workflows/auto-gate-on-issue-open.yml
+# Pinned @v1 per the pinning policy in GundysShrubberies/claude-workflows#16.
+#
+# PUBLIC repo: `runner-label` is GitHub-hosted `ubuntu-latest`, never
+# self-hosted (operator decision 2026-09-28, claude-plugins#3).
+#
+# Required repo secret: PROJECT_PAT (the built-in GITHUB_TOKEN cannot write a
+# Projects v2 board). When it is absent the reusable skips the board step with
+# a notice and exits green.
+name: Auto gate
+
+on:
+  issues:
+    types: [opened]
+
+jobs:
+  gate:
+    permissions:
+      issues: write
+    uses: GundysShrubberies/claude-workflows/.github/workflows/auto-gate-on-issue-open.yml@v1
+    with:
+      runner-label: '"ubuntu-latest"'
+    secrets:
+      project_pat: ${{ secrets.PROJECT_PAT }}

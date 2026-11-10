@@ -1,0 +1,39 @@
+# Thin caller — review-tier floor gate (arbor#72, part of arbor#146).
+# All logic lives in the reusable workflow:
+#   GundysShrubberies/claude-workflows/.github/workflows/tier-check.yml@v1
+# Reads .arbor/review-tiers.json (default path) for the path→tier map.
+# The merger's `merge-blocked` brake is NOT hosted here: it has its own caller,
+# merge-blocked.yml next to this file (arbor-dotfiles#1192), so this file's
+# cancel-in-progress never cancels it. tier-check itself stays read-only.
+#
+# PUBLIC repo: `runner-label` is GitHub-hosted `ubuntu-latest`, never
+# self-hosted (operator decision 2026-09-28, claude-plugins#3). The reusable
+# workflow hard-errors if `self-hosted` is requested on a public repo, since
+# CI secrets would otherwise be reachable from fork-PR code.
+name: Tier check
+
+on:
+  pull_request:
+    # No `branches:` filter (arbor-dotfiles#888): the gate must run for every
+    # PR, including stacked PRs whose base is another feature branch.
+    # `edited` re-runs the floor on a Risk-tier bump; `labeled`/`unlabeled`
+    # re-run it when a label changes. Never add a job-level `if` that skips on
+    # body edits: a skipped newest run would mask an earlier red one
+    # (arbor-dotfiles#889).
+    types: [opened, synchronize, reopened, edited, labeled, unlabeled]
+
+# Per-PR concurrency group (arbor#393): a newer push supersedes the older run.
+concurrency:
+  group: tier-check-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  tier-check:
+    # The reusable workflow's token is capped by its caller, so grant the
+    # scopes it needs here (contents: read, pull-requests: read).
+    permissions:
+      contents: read
+      pull-requests: read
+    uses: GundysShrubberies/claude-workflows/.github/workflows/tier-check.yml@v1
+    with:
+      runner-label: '"ubuntu-latest"'

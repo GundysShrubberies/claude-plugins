@@ -1,0 +1,34 @@
+# Thin caller — merge-provenance ledger (arbor-dotfiles#257).
+# All logic lives in the reusable workflow:
+#   GundysShrubberies/claude-workflows/.github/workflows/merge-log.yml@v1
+# Reads the merged PR's `merged-by:worker|merger|bypass` label to record which
+# path merged it.
+#
+# PUBLIC repo: `runner-label` is GitHub-hosted `ubuntu-latest`, never
+# self-hosted (operator decision 2026-09-28, claude-plugins#3).
+
+name: Merge log
+
+on:
+  pull_request:
+    types: [closed]
+
+jobs:
+  merge-log:
+    if: github.event.pull_request.merged == true
+    # The reusable's token is capped by these permissions: contents and
+    # pull-requests to read the merged PR's labels, checks to read the tier
+    # floor from the tier-check annotations.
+    permissions:
+      contents: read
+      pull-requests: read
+      checks: read
+    uses: GundysShrubberies/claude-workflows/.github/workflows/merge-log.yml@v1
+    with:
+      runner-label: '"ubuntu-latest"'
+    secrets:
+      # Required by the reusable: it writes the ledger entry to the foreign
+      # GundysShrubberies/arbor-ledger repo.
+      ARBOR_ORG_PAT: ${{ secrets.ARBOR_ORG_PAT }}
+      # Optional: unset means the reusable's Discord step silently no-ops.
+      ARBOR_DISCORD_WEBHOOK_PR_FLOW: ${{ secrets.ARBOR_DISCORD_WEBHOOK_PR_FLOW }}

@@ -1,0 +1,34 @@
+# Thin caller — merger security-BLOCK brake (arbor-dotfiles#957, cw#475), in its own
+# workflow so tier-check.yml's cancel-in-progress can never cancel it
+# (arbor-dotfiles#1192).
+# All logic lives in the reusable workflow:
+#   GundysShrubberies/claude-workflows/.github/workflows/merge-blocked.yml@v1
+#
+# The required-check context is `merge-blocked / merge-blocked`; it must not change.
+# PUBLIC repo: `runner-label` is GitHub-hosted `ubuntu-latest`, never
+# self-hosted (operator decision 2026-09-28, claude-plugins#3).
+name: Merge blocked
+
+# NO `cancel-in-progress: true`: a running check must finish. The `unlabeled
+# merge:blocked` event posts the lift audit comment, so it gets its own group
+# (arbor-dotfiles#1166).
+concurrency:
+  group: merge-blocked-${{ github.event.pull_request.number }}${{ github.event.action == 'unlabeled' && github.event.label.name == 'merge:blocked' && '-lift' || '' }}
+  cancel-in-progress: false
+
+on:
+  pull_request:
+    # No `branches:` filter (arbor-dotfiles#971): the brake holds for stacked PRs.
+    types: [opened, synchronize, reopened, edited, labeled, unlabeled]
+
+jobs:
+  # Fails while the `merge:blocked` label is present. Never add a job-level `if:`
+  # (a skipped newest run masks an earlier red one).
+  merge-blocked:
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+    uses: GundysShrubberies/claude-workflows/.github/workflows/merge-blocked.yml@v1
+    with:
+      runner-label: '"ubuntu-latest"'

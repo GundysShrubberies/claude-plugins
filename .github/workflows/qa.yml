@@ -1,0 +1,60 @@
+# Lightweight QA for a scripts-and-JSON repo (claude-plugins#6).
+# The shared claude-workflows qa.yml is npm/Node-only, and this repo has no
+# package.json, so the check runs inline:
+#   - shellcheck on every shell script under plugins/ (found by shebang)
+#   - JSON validity for every tracked *.json file
+# PUBLIC repo: GitHub-hosted `ubuntu-latest`, never self-hosted
+# (operator decision 2026-09-28, claude-plugins#3). shellcheck and jq ship on
+# the hosted image.
+name: QA
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: qa-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  qa:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: shellcheck plugin scripts
+        run: |
+          set -euo pipefail
+          mapfile -t scripts < <(git ls-files plugins \
+            | while IFS= read -r f; do
+                if head -n1 "$f" | grep -qE '^#!.*\b(ba|z)?sh\b'; then
+                  printf '%s\n' "$f"
+                fi
+              done)
+          if [ "${#scripts[@]}" -eq 0 ]; then
+            echo "no shell scripts found under plugins/"
+            exit 1
+          fi
+          shellcheck --version
+          printf 'checking %s\n' "${scripts[@]}"
+          shellcheck "${scripts[@]}"
+
+      - name: JSON validity
+        run: |
+          set -euo pipefail
+          mapfile -t files < <(git ls-files '*.json')
+          status=0
+          for f in "${files[@]}"; do
+            if jq empty "$f"; then
+              echo "ok: $f"
+            else
+              echo "::error file=$f::invalid JSON"
+              status=1
+            fi
+          done
+          exit "$status"

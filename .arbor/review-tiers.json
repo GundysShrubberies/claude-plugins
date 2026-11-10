@@ -1,0 +1,12 @@
+{
+  "default": "show",
+  "paths": [
+    { "glob": ".github/workflows/*",      "tier": "ask" },
+    { "glob": ".arbor/review-tiers.json", "tier": "ask" },
+    { "glob": "plugins/*/hooks/*",        "tier": "ask" },
+    { "glob": "plugins/*/scripts/*",      "tier": "show" },
+    { "glob": "README.md",                "tier": "ship" },
+    { "glob": "plugins/*/README.md",      "tier": "ship" }
+  ],
+  "size": { "ship_max_changed_lines": 50, "show_max_changed_lines": 400 }
+}

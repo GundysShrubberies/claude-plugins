@@ -21,7 +21,7 @@ BIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # hook's input carries no context_window field at all — so this is the one
 # chance to record the model's real window size for claude-context-gauge's
 # model-name table to be overridden by later PreToolUse calls in the same
-# session (e.g. an orchestrator model like claude-fable-5-1 that runs a
+# session (e.g. an orchestrator model like claude-fable-5-2 that runs a
 # 1,000,000-token window without an `[1m]`/`-1m` id suffix).
 CTX_STATE_DIR="${TMPDIR:-/tmp}/claude-tool-guard"
 input=$(cat)
